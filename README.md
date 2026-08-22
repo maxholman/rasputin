@@ -43,16 +43,49 @@ converge path, so there is no drift between "what I asked for" and "what boots".
 
 ## Deploy
 
+### First run, or any run on a box you cannot physically reach
+
+Stage it. Install the files without applying anything live, then bring the
+firewall up behind a rollback window:
+
     cd ansible
-    ansible-playbook site.yml                      # config only
-    ansible-playbook site.yml -e purge_raspap=true # also rip RaspAP out
 
-`purge_raspap` defaults to **false** so a routine run never silently removes
-the web UI. Flip it once you're happy.
+    # 1. files only - netmode, dnsmasq snippets, boot unit. Nothing applied.
+    ansible-playbook site.yml --ask-become-pass -e converge_on_deploy=false
 
-`ap_passphrase` is undefined on purpose — put it in ansible-vault:
+    # 2. apply mode + firewall, auto-reverting in 5 minutes
+    ssh -t pi@10.6.141.1 'sudo netmode serve --rollback 300'
+
+    # 3. from a NEW terminal - prove you can still get in, then keep it
+    ssh -t pi@10.6.141.1 'sudo netmode confirm'
+
+Step 3 must be a **new** session. `ct state established` keeps an existing
+connection alive straight through a broken ruleset, so confirming from the
+window you switched from proves nothing.
+
+### Routine runs
+
+    ansible-playbook site.yml --ask-become-pass
+
+This DOES converge — it applies the mode and firewall immediately, with no
+rollback window. Only appropriate once the ruleset is known good.
+
+### Flags
+
+| flag | default | effect |
+|---|---|---|
+| `converge_on_deploy` | `true` | apply mode+firewall at the end of the run |
+| `purge_raspap` | `false` | stop/disable RaspAP and delete its dnsmasq fragments |
+
+`ap_passphrase` is undefined on purpose, so `hostapd.conf` is left alone and
+your AP keeps its current config and clients. Vault it to manage the AP:
 
     ansible-vault create group_vars/pi_router/vault.yml
+
+### Expect during a converge
+
+`netmode` restarts `dhcpcd` for `eth0`, which briefly bounces the wired link —
+and with it the WAN of anything downstream. Harmless, but not silent.
 
 ## Firewall
 
