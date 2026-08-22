@@ -1,0 +1,31 @@
+---
+# Validate BEFORE restarting. This is the step whose absence took the
+# network down: an invalid fragment was written, dnsmasq died, and the only
+# recovery path offered was `reload` - which cannot revive a failed unit.
+- name: restart dnsmasq
+  ansible.builtin.shell: dnsmasq --test && systemctl restart dnsmasq
+  changed_when: true
+
+# hostapd has no offline config-test mode, so this restarts and then confirms
+# it actually came up rather than assuming success.
+- name: restart hostapd
+  ansible.builtin.systemd:
+    name: hostapd
+    state: restarted
+
+- name: verify hostapd came up
+  ansible.builtin.command: systemctl is-active hostapd
+  register: _hostapd
+  failed_when: _hostapd.stdout.strip() != 'active'
+  changed_when: false
+
+- name: reload systemd
+  ansible.builtin.systemd: daemon_reload=true
+
+# On a first deploy leave this OFF (-e converge_on_deploy=false) and run
+# `netmode serve --rollback 300` by hand, so an untested firewall cannot
+# strand you. Converging from a handler gives you no rollback window.
+- name: converge netmode
+  ansible.builtin.command: /usr/local/sbin/netmode converge
+  when: converge_on_deploy | default(true) | bool
+  changed_when: true

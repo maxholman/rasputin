@@ -1,0 +1,104 @@
+---
+- name: Install router packages
+  ansible.builtin.apt:
+    name: [dnsmasq, hostapd, dhcpcd5, nftables]
+    state: present
+    update_cache: true
+
+# --- RaspAP-ectomy (opt-in: -e purge_raspap=true) --------------------------
+- name: Stop and disable RaspAP services
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: stopped
+    enabled: false
+  loop: [raspapd, lighttpd]
+  failed_when: false
+  when: purge_raspap | default(false) | bool
+
+- name: Remove RaspAP-generated dnsmasq fragments
+  ansible.builtin.file:
+    path: "/etc/dnsmasq.d/{{ item }}"
+    state: absent
+  loop:
+    - 090_raspap.conf
+    - 090_wlan0.conf   # should never have existed: wlan0 is always a client
+    - 090_wlan1.conf
+    - 090_eth0.conf
+  notify: restart dnsmasq
+  when: purge_raspap | default(false) | bool
+
+# --- config ----------------------------------------------------------------
+- name: Base dnsmasq policy
+  ansible.builtin.template:
+    src: 10-base.conf.j2
+    dest: /etc/dnsmasq.d/10-base.conf
+    mode: "0644"
+  notify: restart dnsmasq
+
+- name: AP dnsmasq config (constant)
+  ansible.builtin.template:
+    src: 20-wlan1-ap.conf.j2
+    dest: /etc/dnsmasq.d/20-wlan1-ap.conf
+    mode: "0644"
+  notify: restart dnsmasq
+
+# Staged, not installed: netmode installs/removes it per mode.
+- name: Stage the eth0-LAN snippet
+  ansible.builtin.template:
+    src: 30-eth0-lan.conf.j2
+    dest: /usr/local/share/netmode/30-eth0-lan.conf
+    mode: "0644"
+  notify: converge netmode
+
+# Skipped unless ap_passphrase is vaulted. Without this guard the run aborts on
+# an undefined variable - or worse, renders an empty passphrase and drops every
+# client currently associated to the AP.
+- name: hostapd config
+  ansible.builtin.template:
+    src: hostapd.conf.j2
+    dest: /etc/hostapd/hostapd.conf
+    mode: "0600"
+  when: ap_passphrase is defined and ap_passphrase | length > 0
+  notify: restart hostapd
+
+- name: Warn if hostapd is unmanaged
+  ansible.builtin.debug:
+    msg: "ap_passphrase undefined - leaving /etc/hostapd/hostapd.conf alone. Vault it to manage the AP."
+  when: ap_passphrase is not defined or ap_passphrase | length == 0
+
+- name: Install netmode
+  ansible.builtin.template:
+    src: netmode.j2
+    dest: /usr/local/sbin/netmode
+    mode: "0755"
+  notify: converge netmode
+
+- name: Converge-on-boot unit
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/netmode-converge.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Converge declared network mode
+      After=network-pre.target dhcpcd.service
+      Wants=network-pre.target
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/local/sbin/netmode converge
+      [Install]
+      WantedBy=multi-user.target
+  notify: reload systemd
+
+- name: Seed the declared mode if unset
+  ansible.builtin.copy:
+    dest: /etc/netmode/mode
+    content: "{{ default_mode }}\n"
+    mode: "0644"
+    force: false
+
+- name: Enable services
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    enabled: true
+  loop: [dnsmasq, hostapd, dhcpcd, netmode-converge]

@@ -1,0 +1,3 @@
+# vault / secrets
+group_vars/**/vault.yml
+*.retry

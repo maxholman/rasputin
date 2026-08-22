@@ -1,0 +1,12 @@
+# Base dnsmasq policy. Managed by Ansible.
+log-facility=/var/log/dnsmasq.log
+conf-dir=/etc/dnsmasq.d
+domain-needed
+bogus-priv
+
+# `interface=` alone does NOT prevent dnsmasq answering elsewhere: without this
+# it opens a wildcard socket and becomes an open resolver on the venue's wifi.
+# bind-dynamic (not bind-interfaces) so it copes with interfaces coming up late.
+bind-dynamic
+except-interface={{ wan_wifi_if }}
+no-dhcp-interface={{ wan_wifi_if }}

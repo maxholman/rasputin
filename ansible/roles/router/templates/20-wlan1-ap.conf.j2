@@ -1,0 +1,4 @@
+# {{ ap_if }} is the USB dongle and is ALWAYS the AP. Constant in both modes.
+interface={{ ap_if }}
+dhcp-range={{ ap_subnet }}.{{ ap_dhcp_start }},{{ ap_subnet }}.{{ ap_dhcp_end }},255.255.255.0,12h
+dhcp-option=6,{{ client_dns | join(',') }}

@@ -1,0 +1,5 @@
+---
+- name: Travel router
+  hosts: pi_router
+  become: true
+  roles: [router]

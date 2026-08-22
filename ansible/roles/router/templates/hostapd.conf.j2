@@ -1,0 +1,32 @@
+# {{ ap_if }} AP. Constant - no mode switch rewrites this.
+interface={{ ap_if }}
+driver=nl80211
+ctrl_interface=/var/run/hostapd
+ctrl_interface_group=0
+ssid={{ ap_ssid }}
+country_code={{ ap_country }}
+hw_mode=a
+channel={{ ap_channel }}
+ieee80211d=1
+ieee80211n=1
+ieee80211ac=1
+ieee80211ax=1
+wmm_enabled=1
+auth_algs=1
+wpa=2
+wpa_key_mgmt=WPA-PSK
+wpa_pairwise=CCMP
+ieee80211w=1
+ignore_broadcast_ssid=0
+he_su_beamformer=1
+he_su_beamformee=1
+he_mu_beamformer=1
+he_bss_color=1
+he_oper_chwidth=1
+vht_oper_chwidth=1
+he_oper_centr_freq_seg0_idx=42
+vht_oper_centr_freq_seg0_idx=42
+ht_capab=[HT40+][LDPC][SHORT-GI-20][SHORT-GI-40][TX-STBC][RX-STBC1][MAX-AMSDU-7935]
+vht_capab=[RXLDPC][SHORT-GI-80][TX-STBC-2BY1][RX-STBC-1][MAX-MPDU-11454][MAX-A-MPDU-LEN-EXP7]
+# Keep in ansible-vault, never in plaintext:
+wpa_passphrase={{ ap_passphrase }}

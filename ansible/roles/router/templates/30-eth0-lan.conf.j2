@@ -1,0 +1,5 @@
+# Installed by `netmode lan` ONLY. In wan mode {{ eth_if }} is a DHCP client
+# and this file is removed, so dnsmasq never answers DHCP on an uplink.
+interface={{ eth_if }}
+dhcp-range={{ eth_subnet }}.{{ eth_dhcp_start }},{{ eth_subnet }}.{{ eth_dhcp_end }},255.255.255.0,12h
+dhcp-option=6,{{ client_dns | join(',') }}

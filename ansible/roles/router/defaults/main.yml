@@ -1,0 +1,37 @@
+# ---------------------------------------------------------------------------
+# The declared truth for this router. Everything else is generated from here.
+#
+# Hardware invariants (NOT configurable - they are physical facts):
+#   wlan0  built-in brcmfmac  always a wifi CLIENT (cannot AP reliably)
+#   wlan1  USB MT7921 dongle  always the AP
+#   eth0                      either DHCP server (mode=lan) or client (mode=wan)
+# ---------------------------------------------------------------------------
+wan_wifi_if: wlan0
+ap_if: wlan1
+eth_if: eth0
+
+# wlan1 AP - constant in both modes.
+ap_ssid: pineapple2
+ap_channel: 36
+ap_country: TW
+ap_subnet: 10.9.141
+ap_dhcp_start: 50
+ap_dhcp_end: 254
+
+# eth0 when it is serving (mode=lan only).
+eth_subnet: 10.6.141
+eth_dhcp_start: 50
+eth_dhcp_end: 200
+
+# Pushed to DHCP clients so they resolve independently of this box's upstream.
+client_dns: [1.1.1.1, 1.1.1.2]
+
+default_mode: serve
+
+# Admin plane. SSH is permitted only on interfaces acting as LAN in the current
+# mode. Setting this true also exposes SSH on the uplink - i.e. to the hotel.
+admin_on_uplink: false
+
+# Whether deploying should immediately apply the network mode + firewall.
+# Set false for the first run on a box you cannot physically reach.
+converge_on_deploy: true
