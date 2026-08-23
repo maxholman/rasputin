@@ -35,3 +35,8 @@ admin_on_uplink: false
 # Whether deploying should immediately apply the network mode + firewall.
 # Set false for the first run on a box you cannot physically reach.
 converge_on_deploy: true
+
+# Privacy on venue networks. Randomises wlan0's MAC per-ESS and eth0's MAC when
+# eth0 is the uplink. Turn off only if some network you rely on does MAC-based
+# auth or hands you a MAC reservation you need.
+randomize_client_mac: true

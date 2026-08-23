@@ -126,6 +126,52 @@
     msg: "ap_passphrase undefined - leaving /etc/hostapd/hostapd.conf alone. Vault it to manage the AP."
   when: ap_passphrase is not defined or ap_passphrase | length == 0
 
+# netfilter-persistent restores /etc/iptables/rules.v4 at every boot, which is
+# where RaspAP's blanket masquerade comes back from. NAT belongs to nftables
+# now, so the nat table is emptied. Docker adds its own rules at runtime and is
+# unaffected. The 192.168.50.0/24 rule referenced a subnet that does not exist.
+- name: Stop netfilter-persistent restoring RaspAP's blanket NAT
+  ansible.builtin.copy:
+    dest: /etc/iptables/rules.v4
+    mode: "0644"
+    backup: true
+    content: |
+      # Managed by rasputin. NAT is owned by nftables (table inet netmode).
+      *nat
+      :PREROUTING ACCEPT [0:0]
+      :INPUT ACCEPT [0:0]
+      :OUTPUT ACCEPT [0:0]
+      :POSTROUTING ACCEPT [0:0]
+      COMMIT
+
+# wlan0 presents a fresh MAC to each SSID, and a random one while merely
+# scanning - otherwise the real MAC is broadcast before you ever associate.
+- name: Randomise the wifi client MAC per network
+  ansible.builtin.lineinfile:
+    path: /etc/wpa_supplicant/wpa_supplicant.conf
+    line: "{{ item }}"
+    insertbefore: BOF
+    state: "{{ 'present' if (randomize_client_mac | default(true) | bool) else 'absent' }}"
+  loop:
+    - mac_addr=1
+    - preassoc_mac_addr=1
+  notify: restart wpa_supplicant
+
+# Stop announcing ourselves to every venue's DHCP server. `hostname` sends
+# "raspberrypi"; `clientid` sends a stable identifier that survives MAC
+# randomisation and defeats the point of it entirely.
+- name: Do not leak hostname to venue DHCP servers
+  ansible.builtin.replace:
+    path: /etc/dhcpcd.conf
+    regexp: '^hostname$'
+    replace: '#hostname   # rasputin: do not announce ourselves to venues'
+
+- name: Do not send a stable DHCP client identifier
+  ansible.builtin.replace:
+    path: /etc/dhcpcd.conf
+    regexp: '^clientid$'
+    replace: 'noclientid  # rasputin: a stable clientid would defeat MAC randomisation'
+
 - name: Install netmode
   ansible.builtin.template:
     src: netmode.j2

@@ -33,3 +33,10 @@
   ansible.builtin.command: /usr/local/sbin/netmode converge
   when: converge_on_deploy | default(true) | bool
   changed_when: true
+
+# Reassociates with the new MAC. Brief loss of the uplink; LAN admin is
+# unaffected because it does not traverse wlan0.
+- name: restart wpa_supplicant
+  ansible.builtin.systemd:
+    name: wpa_supplicant
+    state: restarted

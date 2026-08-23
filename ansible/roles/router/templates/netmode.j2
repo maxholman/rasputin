@@ -190,6 +190,16 @@ $lateral
 }
 NFT
 
+  # RaspAP left a blanket "-A POSTROUTING -j MASQUERADE" in the ip nat table.
+  # It NATs out WHATEVER interface traffic takes, so the moment a tunnel drops
+  # clients keep browsing straight out the venue's wifi, unprotected. A kill
+  # switch cannot work while it exists. Docker's own rule is scoped with -s and
+  # is left alone; we only remove unscoped blanket rules.
+  while iptables -t nat -C POSTROUTING -j MASQUERADE 2>/dev/null; do
+    iptables -t nat -D POSTROUTING -j MASQUERADE || break
+    echo "netmode: removed a blanket iptables MASQUERADE (kill-switch prerequisite)"
+  done
+
   # Validate before loading. A bad ruleset must never reach the kernel.
   if ! nft -c -f "$STATE_DIR/ruleset.nft"; then
     echo "netmode: nftables ruleset invalid; firewall unchanged" >&2
@@ -255,10 +265,52 @@ cancel_rollback() {
   fi
 }
 
+# A locally-administered, unicast MAC. Only ever applied to the interface
+# facing the venue - never to a LAN leg, where a changing MAC would break
+# every client's ARP cache and our own DHCP reservations.
+randomize_mac() {
+  local ifc="$1" mac
+  mac=$(printf '02:%02x:%02x:%02x:%02x:%02x' \
+        $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)))
+  ip link set dev "$ifc" down 2>/dev/null || true
+  if ip link set dev "$ifc" address "$mac" 2>/dev/null; then
+    echo "netmode: $ifc MAC randomised to $mac"
+  else
+    echo "netmode: WARNING - could not randomise MAC on $ifc" >&2
+  fi
+  ip link set dev "$ifc" up 2>/dev/null || true
+}
+
+# brcmfmac (the Pi's built-in wifi) advertises scan randomisation but NOT
+# per-ESS association randomisation, so wpa_supplicant's mac_addr=1 silently
+# does nothing. It does accept `ip link set address` though, so the MAC is set
+# directly and the supplicant restarted to associate using it.
+reassociate_wifi() {
+  systemctl restart wpa_supplicant 2>/dev/null || true
+  local i
+  for i in $(seq 1 20); do
+    if [[ -n "$(ip -4 -o addr show dev "$WIFI" 2>/dev/null)" ]]; then
+      echo "netmode: $WIFI reassociated as $(cat /sys/class/net/$WIFI/address)"
+      return 0
+    fi
+    dhcpcd -n "$WIFI" >/dev/null 2>&1 || true
+    sleep 1
+  done
+  echo "netmode: WARNING - $WIFI has no address after MAC change" >&2
+}
+
 converge() {
   local mode; mode=$(cat "$STATE" 2>/dev/null) || die "no declared mode at $STATE - run: netmode serve|uplink"
   [[ $mode == serve || $mode == uplink ]] || die "bad declared mode: $mode"
   local uplink; [[ $mode == serve ]] && uplink="$WIFI" || uplink="$ETH"
+
+{% if randomize_client_mac | default(true) | bool %}
+  # Whichever leg faces the venue gets a fresh identity on every converge -
+  # arriving somewhere new is exactly when a new identity is wanted. LAN legs
+  # are never touched: a changing MAC there would break client ARP caches.
+  randomize_mac "$uplink"
+  [[ "$uplink" == "$WIFI" ]] && reassociate_wifi
+{% endif %}
 
   write_dhcpcd_block "$mode"
 
