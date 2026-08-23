@@ -63,7 +63,11 @@ write_dhcpcd_block() {
 # Admin (SSH) and DNS are bound to whatever is LAN *in this mode*, never to the
 # uplink. On a travel router the uplink is hostile by definition.
 apply_firewall() {
-  local uplink="$1" mode="$2" lan_list admin_list
+  local uplink="$1" mode="$2" vpn="${3:-0}" lan_list admin_list egress
+  # THE KILL SWITCH. With the VPN up, the tunnel is the only permitted exit.
+  # If wg0 disappears, no forward rule matches and policy drop takes over -
+  # clients lose connectivity rather than silently egressing in the clear.
+  if [[ $vpn == 1 ]]; then egress="$VPN_IF"; else egress="$uplink"; fi
   if [[ $mode == serve ]]; then lan_list="\"$ETH\", \"$AP\""; else lan_list="\"$AP\""; fi
   admin_list="$lan_list"
 {% if admin_on_uplink | default(false) | bool %}
@@ -105,7 +109,11 @@ apply_firewall() {
   upgw=$(ip -4 route show default dev "$uplink" 2>/dev/null \
          | awk '{for(i=1;i<=NF;i++) if($i=="via") {print $(i+1); exit}}')
   if [[ -n "$upnet" ]]; then
-    if [[ -n "$upgw" ]]; then
+    # With the tunnel up there is no legitimate reason for a client to talk to
+    # the venue gateway in the clear - the portal was completed before the VPN
+    # came up. Leaving the exception open would be a hole straight through the
+    # kill switch to a venue-controlled device.
+    if [[ -n "$upgw" && $vpn != 1 ]]; then
       # Only the ports a captive portal needs. A blanket accept here would let
       # SMB and mDNS reach the venue's own gateway - the exact inventory leak
       # the discovery drops below exist to prevent.
@@ -178,14 +186,14 @@ $lateral
     iifname @lan_ifaces oifname "$uplink" udp dport { 5353, 5355, 1900, 137, 138 } drop
     iifname @lan_ifaces oifname "$uplink" tcp dport { 139, 445 } drop
 
-    iifname @lan_ifaces oifname "$uplink" accept
+    iifname @lan_ifaces oifname "$egress" accept
     iifname @lan_ifaces oifname @lan_ifaces accept
     # uplink -> LAN is only ever reply traffic, matched by the ct rule above
   }
 
   chain postrouting {
     type nat hook postrouting priority srcnat;
-    oifname "$uplink" masquerade
+    oifname "$egress" masquerade
   }
 }
 NFT
@@ -299,10 +307,65 @@ reassociate_wifi() {
   echo "netmode: WARNING - $WIFI has no address after MAC change" >&2
 }
 
+VPN_IF={{ vpn_interface }}
+VPN_DNS={{ vpn_dns }}
+UPSTREAM=/etc/dnsmasq.d/099-upstream.conf
+
+# A profile is the unit of switching. MODE decides eth0's role, VPN decides
+# whether traffic may leave any way other than the tunnel.
+resolve_profile() {
+  case "$1" in
+{% for name, p in netmode_profiles.items() %}
+    {{ name }}) MODE={{ p.mode }}; VPN={{ 1 if p.vpn else 0 }} ;;
+{% endfor %}
+    serve|lan)   MODE=serve;  VPN=0 ;;
+    uplink|wan)  MODE=uplink; VPN=0 ;;
+    *) die "unknown profile: $1\n  known: {{ netmode_profiles.keys()|join(' ') }} serve uplink" ;;
+  esac
+}
+
+vpn_start() {
+  ip link show "$VPN_IF" >/dev/null 2>&1 && return 0
+  wg-quick up "$VPN_IF" >/dev/null 2>&1 \
+    || die "VPN required by this profile but failed to start; refusing to continue unprotected"
+  echo "netmode: $VPN_IF up"
+}
+
+vpn_stop() {
+  ip link show "$VPN_IF" >/dev/null 2>&1 || return 0
+  wg-quick down "$VPN_IF" >/dev/null 2>&1 || true
+  echo "netmode: $VPN_IF down"
+}
+
+# DNS upstream must follow VPN state or it becomes the leak. With the tunnel up
+# the ONLY upstream is inside it, so a tunnel drop means DNS stops rather than
+# quietly falling back to the venue's resolver.
+write_upstream() {
+  if [[ $1 == 1 ]]; then
+    cat > "$UPSTREAM" <<EOF
+# Managed by netmode. VPN is UP: resolve only inside the tunnel, fail closed.
+no-resolv
+server=$VPN_DNS
+EOF
+  else
+    cat > "$UPSTREAM" <<EOF
+# Managed by netmode. VPN is DOWN: public resolvers.
+no-resolv
+{% for d in clear_dns %}server={{ d }}
+{% endfor %}EOF
+  fi
+}
+
 converge() {
-  local mode; mode=$(cat "$STATE" 2>/dev/null) || die "no declared mode at $STATE - run: netmode serve|uplink"
-  [[ $mode == serve || $mode == uplink ]] || die "bad declared mode: $mode"
+  local profile; profile=$(cat "$STATE" 2>/dev/null) || die "no declared profile at $STATE - run: netmode <profile>"
+  local MODE VPN; resolve_profile "$profile"
+  local mode="$MODE"
   local uplink; [[ $mode == serve ]] && uplink="$WIFI" || uplink="$ETH"
+
+  # Tunnel first: the firewall below is generated around where traffic may exit,
+  # so it must be built knowing whether wg0 exists.
+  if [[ $VPN == 1 ]]; then vpn_start; else vpn_stop; fi
+  write_upstream "$VPN"
 
 {% if randomize_client_mac | default(true) | bool %}
   # Whichever leg faces the venue gets a fresh identity on every converge -
@@ -331,7 +394,7 @@ converge() {
   systemctl restart dnsmasq
 
   [[ -n "${ROLLBACK:-}" ]] && schedule_rollback "$ROLLBACK"
-  if ! apply_firewall "$uplink" "$mode"; then
+  if ! apply_firewall "$uplink" "$mode" "$VPN"; then
     systemctl stop netmode-rollback.timer 2>/dev/null || true
     die "firewall apply failed; rollback disarmed, previous ruleset left intact"
   fi
@@ -341,7 +404,9 @@ converge() {
 }
 
 status() {
-  echo "declared mode : $(cat "$STATE" 2>/dev/null || echo '<unset>')"
+  echo "profile       : $(cat "$STATE" 2>/dev/null || echo '<unset>')"
+  echo "vpn ($VPN_IF)    : $(ip link show "$VPN_IF" >/dev/null 2>&1 && echo UP || echo down)"
+  echo "egress        : $(nft list chain inet netmode postrouting 2>/dev/null | grep -oE 'oifname "[a-z0-9]+" masquerade' || echo none)"
   echo "dnsmasq       : $(systemctl is-active dnsmasq)"
   echo "hostapd       : $(systemctl is-active hostapd)"
   echo "lan snippet   : $([[ -f $LAN_SNIPPET ]] && echo present || echo absent)"
@@ -364,11 +429,14 @@ done
 # ambiguous: eth0 being "the WAN for UniFi" means eth0 SERVES. Old names
 # remain as aliases so muscle memory keeps working.
 case "$cmd" in
+{% for name in netmode_profiles.keys() %}
+  {{ name }})  echo {{ name }} > "$STATE"; converge ;;
+{% endfor %}
   serve|lan)   echo serve  > "$STATE"; converge ;;
   uplink|wan)  echo uplink > "$STATE"; converge ;;
   converge) converge ;;
   confirm)  cancel_rollback ;;
   rollback-fire) rollback_fire ;;
   status)   status ;;
-  *) die "usage: netmode {serve|uplink|converge|confirm|status} [--rollback SECS]\n  serve  = eth0 FEEDS the wired net (this is UniFi WAN)\n  uplink = eth0 TAKES an address from the venue" ;;
+  *) die "usage: netmode {{'{'}}{{ netmode_profiles.keys()|join('|') }}|serve|uplink|converge|confirm|status{{'}'}} [--rollback SECS]\n  serve  = eth0 FEEDS the wired net (this is UniFi WAN)\n  uplink = eth0 TAKES an address from the venue" ;;
 esac

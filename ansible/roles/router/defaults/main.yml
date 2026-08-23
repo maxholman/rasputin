@@ -40,3 +40,18 @@ converge_on_deploy: true
 # eth0 is the uplink. Turn off only if some network you rely on does MAC-based
 # auth or hands you a MAC reservation you need.
 randomize_client_mac: true
+
+# ---------------------------------------------------------------------------
+# Venue profiles. One word sets WAN leg + VPN state + DNS upstream together,
+# because setting them independently at midnight in a hotel is how you get it
+# wrong. mode=serve means eth0 FEEDS a downstream network; mode=uplink means
+# eth0 CONSUMES the venue's.
+# ---------------------------------------------------------------------------
+netmode_profiles:
+  home:       {mode: serve,  vpn: false}   # 5G hotspot upstream, no tunnel
+  hotel-wifi: {mode: serve,  vpn: true}    # venue wifi upstream, tunnel + killswitch
+  hotel-eth:  {mode: uplink, vpn: true}    # venue ethernet upstream, tunnel + killswitch
+
+vpn_interface: wg0
+vpn_dns: 10.2.0.1          # Proton's resolver, reachable only inside the tunnel
+clear_dns: [1.1.1.1, 1.0.0.1]
