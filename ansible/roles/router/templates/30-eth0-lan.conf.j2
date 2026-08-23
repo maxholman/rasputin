@@ -2,4 +2,7 @@
 # and this file is removed, so dnsmasq never answers DHCP on an uplink.
 interface={{ eth_if }}
 dhcp-range={{ eth_subnet }}.{{ eth_dhcp_start }},{{ eth_subnet }}.{{ eth_dhcp_end }},255.255.255.0,12h
-dhcp-option=6,{{ client_dns | join(',') }}
+# Point clients at THIS box, and only this box. Handing out a public
+# resolver as well would let every client silently bypass the blocklist,
+# the DoH upstream and the kill switch the moment blocky hiccupped.
+dhcp-option=6,{{ eth_subnet }}.1

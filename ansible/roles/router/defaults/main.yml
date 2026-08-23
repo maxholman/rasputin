@@ -23,8 +23,9 @@ eth_subnet: 10.6.141
 eth_dhcp_start: 50
 eth_dhcp_end: 200
 
-# Pushed to DHCP clients so they resolve independently of this box's upstream.
-client_dns: [1.1.1.1, 1.1.1.2]
+# Clients are pushed THIS box as their only resolver - see the dnsmasq AP/LAN
+# snippets. There is deliberately no secondary: a public fallback would be a
+# standing bypass around the blocklist, the DoH upstream and the kill switch.
 
 default_mode: serve
 
@@ -53,5 +54,61 @@ netmode_profiles:
   hotel-eth:  {mode: uplink, vpn: true}    # venue ethernet upstream, tunnel + killswitch
 
 vpn_interface: wg0
-vpn_dns: 10.2.0.1          # Proton's resolver, reachable only inside the tunnel
-clear_dns: [1.1.1.1, 1.0.0.1]
+
+# How long to wait for wlan0 to take an address after a MAC change. The old
+# 20s was not always enough and the converge logged "no address after MAC
+# change" while the interface was still associating.
+wifi_reassociate_timeout: 45
+
+blocky_user: blocky
+
+# ---------------------------------------------------------------------------
+# Resolver. Blocky owns :53 and dnsmasq is demoted to DHCP-only.
+#
+# Chosen over AdGuard Home because it does not rewrite its own config at
+# runtime and ships no web UI - on a box that goes to conferences, an admin
+# password is a liability and a config the daemon edits behind Ansible's back
+# is the RaspAP failure mode with a nicer logo.
+# ---------------------------------------------------------------------------
+blocky_version: v0.34.0
+blocky_sha256: 1a07aa52b127d75d15584706c76843b9fa3706be133b0d7b96b2ca65ba4f561f
+
+# Quad9 first: it filters known-malicious domains at the resolver, which is a
+# second opinion on the denylist below rather than a duplicate of it. Given by
+# HOSTNAME because Quad9's certificate has no IP SANs - see blocky_bootstrap.
+# Cloudflare is the fallback for venues that block Quad9. It does NO malware
+# filtering, so in that state the denylist is the only layer left.
+blocky_upstreams:
+  - https://dns.quad9.net/dns-query
+  - https://1.1.1.1/dns-query
+
+# Bootstraps the hostname above. Must be an IP-addressed DoH endpoint or we
+# would need a plaintext query to get started; 1.1.1.1's certificate carries
+# IP SANs for exactly this.
+blocky_bootstrap: https://1.1.1.1/dns-query
+blocky_upstream_timeout: 3s
+
+# Security only. Ads and trackers are handled on-device; adult and gambling
+# categories are deliberately NOT blocked. This list is malware, phishing,
+# ransomware, scam and cryptojacking domains - roughly 360k of them.
+blocky_denylists:
+  threat:
+    - https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/tif.medium-onlydomains.txt
+
+blocky_block_ttl: 6h
+blocky_list_refresh: 24h
+blocky_log_level: info
+
+# DoH listener. Left undefined so the role ships a plain-DNS resolver until
+# there is a certificate clients actually trust; defining both turns the
+# HTTPS listener on. Same guard as ap_passphrase.
+# blocky_doh_cert: /etc/blocky/tls/rasputin.crt
+# blocky_doh_key: /etc/blocky/tls/rasputin.key
+blocky_doh_port: 443
+
+# The router's own traffic. With the tunnel up, nothing may leave except via
+# wg0 and the WireGuard handshake itself - otherwise the resolver's DoH query
+# escapes out the venue's uplink the moment wg0 dies, which is the one leak
+# the client-side kill switch cannot see. The tunnel needs neither DNS nor a
+# correct clock (the peer is a literal IP), so this has no bootstrap deadlock.
+killswitch_restrict_output: true

@@ -40,3 +40,22 @@
   ansible.builtin.systemd:
     name: wpa_supplicant
     state: restarted
+
+# blocky has no offline config test, so this restarts and then proves it
+# resolves - the same shape as the hostapd pair above, and for the same
+# reason: a resolver that failed to start must not report green.
+- name: restart blocky
+  listen: restart blocky
+  ansible.builtin.systemd:
+    name: blocky
+    state: restarted
+    daemon_reload: true
+
+- name: verify blocky resolves
+  listen: restart blocky
+  ansible.builtin.command: /usr/local/bin/blocky healthcheck
+  register: _blocky_hc
+  until: _blocky_hc.rc == 0
+  retries: 10
+  delay: 3
+  changed_when: false

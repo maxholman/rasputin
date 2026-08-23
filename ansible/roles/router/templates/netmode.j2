@@ -121,6 +121,8 @@ apply_firewall() {
     iifname @lan_ifaces oifname \"$uplink\" ip daddr $upgw udp dport 53 accept
     iifname @lan_ifaces oifname \"$uplink\" ip daddr $upgw tcp dport 53 accept
 "
+    elif [[ $vpn == 1 ]]; then
+      echo "netmode: captive-portal exception withheld - the tunnel is up, so the portal is already done" >&2
     else
       echo "netmode: WARNING - no gateway on $uplink; captive portals will be unreachable" >&2
     fi
@@ -128,6 +130,43 @@ apply_firewall() {
   else
     echo "netmode: WARNING - $uplink has no address; venue-lateral rules NOT installed" >&2
   fi
+  # THE OTHER HALF OF THE KILL SWITCH. The forward chain stops CLIENTS leaking
+  # when the tunnel drops; nothing stopped traffic this box originates itself.
+  # That was survivable only while the resolver's upstream was an address that
+  # exists solely inside the tunnel. It is a DoH endpoint on the public
+  # internet now, so a dead wg0 would leave the resolver quietly querying it
+  # out of the venue's uplink - the leak the client-side switch cannot see.
+  local output_policy="accept" output_rules=""
+{% if killswitch_restrict_output | default(true) | bool %}
+  if [[ $vpn == 1 ]]; then
+    local wgep wgip wgport
+    # Read the peer from the LIVE interface, not the config file: wg-quick has
+    # already resolved and applied it, and this cannot disagree with what the
+    # kernel is actually sending to.
+    wgep=$(wg show "$VPN_IF" endpoints 2>/dev/null | awk '{print $2}' | head -1)
+    wgip=${wgep%:*}; wgport=${wgep##*:}
+    # IPv4 only, and validated: an IPv6 endpoint arrives as [addr]:port and
+    # would render an "ip daddr [2001:...]" rule that nft refuses to load.
+    if [[ $wgip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ && $wgport =~ ^[0-9]+$ ]]; then
+      output_policy="drop"
+      output_rules="    oif lo accept
+    ct state established,related accept
+    oifname \"$VPN_IF\" accept
+    oifname @lan_ifaces accept
+    # The handshake that keeps the tunnel alive must survive the chain that
+    # insists on the tunnel, or a single dropped keepalive is unrecoverable.
+    oifname \"$uplink\" ip daddr $wgip udp dport $wgport accept
+    # dhcpcd lease renewal on the venue's uplink.
+    oifname \"$uplink\" udp sport 68 udp dport 67 accept
+    icmp type { destination-unreachable, time-exceeded } accept"
+    else
+      # Fail open, loudly, rather than strand the box: we are already past
+      # vpn_start, so dropping the handshake would kill the tunnel that the
+      # forward chain requires and take everything with it.
+      echo "netmode: WARNING - no usable $VPN_IF peer endpoint ($wgep); output kill switch NOT installed" >&2
+    fi
+  fi
+{% endif %}
   cat > "$STATE_DIR/ruleset.nft" <<NFT
 table inet netmode
 delete table inet netmode
@@ -194,6 +233,13 @@ $lateral
   chain postrouting {
     type nat hook postrouting priority srcnat;
     oifname "$egress" masquerade
+  }
+
+  # Router-originated traffic. Wide open unless the profile demands a tunnel,
+  # in which case wg0 is the only way out for this box too.
+  chain output {
+    type filter hook output priority 0; policy $output_policy;
+$output_rules
   }
 }
 NFT
@@ -296,7 +342,7 @@ randomize_mac() {
 reassociate_wifi() {
   systemctl restart wpa_supplicant 2>/dev/null || true
   local i
-  for i in $(seq 1 20); do
+  for i in $(seq 1 {{ wifi_reassociate_timeout | default(45) }}); do
     if [[ -n "$(ip -4 -o addr show dev "$WIFI" 2>/dev/null)" ]]; then
       echo "netmode: $WIFI reassociated as $(cat /sys/class/net/$WIFI/address)"
       return 0
@@ -308,8 +354,7 @@ reassociate_wifi() {
 }
 
 VPN_IF={{ vpn_interface }}
-VPN_DNS={{ vpn_dns }}
-UPSTREAM=/etc/dnsmasq.d/099-upstream.conf
+BLOCKY_LISTEN=/etc/blocky/config.d/20-listen.yml
 
 # A profile is the unit of switching. MODE decides eth0's role, VPN decides
 # whether traffic may leave any way other than the tunnel.
@@ -337,23 +382,31 @@ vpn_stop() {
   echo "netmode: $VPN_IF down"
 }
 
-# DNS upstream must follow VPN state or it becomes the leak. With the tunnel up
-# the ONLY upstream is inside it, so a tunnel drop means DNS stops rather than
-# quietly falling back to the venue's resolver.
-write_upstream() {
-  if [[ $1 == 1 ]]; then
-    cat > "$UPSTREAM" <<EOF
-# Managed by netmode. VPN is UP: resolve only inside the tunnel, fail closed.
-no-resolv
-server=$VPN_DNS
+# Which addresses the resolver answers on. Specific addresses, never 0.0.0.0:
+# the input chain refuses :53 from the uplink, but `rollback-fire` DELETES that
+# table, and a wildcard bind would turn the lockout insurance into an open
+# resolver on the venue's wifi.
+#
+# The upstream is NOT written here. It is the same DoH endpoint in every
+# profile, and the kill switch is enforced by the output chain below - not, as
+# it used to be, by pointing dnsmasq at a resolver that is only routable inside
+# the tunnel. Keep this in step with blocky-20-listen.yml.j2 in the role.
+write_blocky_listen() {
+  local mode="$1" addrs
+  addrs="127.0.0.1:53,${AP_NET}.1:53"
+  [[ $mode == serve ]] && addrs="${addrs},${ETH_NET}.1:53"
+  mkdir -p "$(dirname "$BLOCKY_LISTEN")"
+  cat > "$BLOCKY_LISTEN" <<EOF
+# Managed by netmode. Mode: $mode
+ports:
+  dns: $addrs
+{% if blocky_doh_cert is defined and blocky_doh_key is defined %}
+  https: ${AP_NET}.1:{{ blocky_doh_port }}$([[ $mode == serve ]] && echo ",${ETH_NET}.1:{{ blocky_doh_port }}")
+certFile: {{ blocky_doh_cert }}
+keyFile: {{ blocky_doh_key }}
+minTlsServeVersion: "1.3"
+{% endif %}
 EOF
-  else
-    cat > "$UPSTREAM" <<EOF
-# Managed by netmode. VPN is DOWN: public resolvers.
-no-resolv
-{% for d in clear_dns %}server={{ d }}
-{% endfor %}EOF
-  fi
 }
 
 converge() {
@@ -365,7 +418,7 @@ converge() {
   # Tunnel first: the firewall below is generated around where traffic may exit,
   # so it must be built knowing whether wg0 exists.
   if [[ $VPN == 1 ]]; then vpn_start; else vpn_stop; fi
-  write_upstream "$VPN"
+  write_blocky_listen "$mode"
 
 {% if randomize_client_mac | default(true) | bool %}
   # Whichever leg faces the venue gets a fresh identity on every converge -
@@ -407,7 +460,9 @@ status() {
   echo "profile       : $(cat "$STATE" 2>/dev/null || echo '<unset>')"
   echo "vpn ($VPN_IF)    : $(ip link show "$VPN_IF" >/dev/null 2>&1 && echo UP || echo down)"
   echo "egress        : $(nft list chain inet netmode postrouting 2>/dev/null | grep -oE 'oifname "[a-z0-9]+" masquerade' || echo none)"
-  echo "dnsmasq       : $(systemctl is-active dnsmasq)"
+  echo "dnsmasq (dhcp): $(systemctl is-active dnsmasq)"
+  echo "blocky (dns)  : $(systemctl is-active blocky)"
+  echo "output guard  : $(nft list chain inet netmode output 2>/dev/null | grep -oE 'policy (drop|accept)' | head -1 || echo none)"
   echo "hostapd       : $(systemctl is-active hostapd)"
   echo "lan snippet   : $([[ -f $LAN_SNIPPET ]] && echo present || echo absent)"
   echo "default route : $(ip route show default | tr '\n' ';' || echo none)"

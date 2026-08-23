@@ -1,0 +1,87 @@
+# Base resolver policy. Managed by Ansible - edit the role, not this file.
+#
+# Blocky owns :53; dnsmasq is demoted to DHCP-only (port=0). Config is a
+# DIRECTORY, merged in filename order with later files winning - the same
+# shape as /etc/dnsmasq.d. This file is the constant half; netmode owns
+# 20-listen.yml, which is the half that changes with the mode.
+
+# Every query leaves this box over TLS, in every profile. There is no
+# plaintext-DNS path to fall back to: the kill switch is enforced by the
+# output chain in netmode's ruleset, not by picking an unroutable upstream.
+upstreams:
+  init:
+    # `fast` = start even when no upstream answers yet. A travel router boots
+    # before it has an uplink; `blocking` would leave us with no resolver at
+    # all until the venue's wifi came up.
+    strategy: fast
+  groups:
+    default:
+{% for u in blocky_upstreams %}
+      - {{ u }}
+{% endfor %}
+  # strict, not parallel_best: the first upstream is chosen for doing its own
+  # malware filtering, and racing it against one that doesn't would let the
+  # loser answer for domains the winner blocks.
+  strategy: strict
+  timeout: {{ blocky_upstream_timeout }}
+
+# Resolving the upstream's OWN hostname cannot go through the upstream.
+# {{ blocky_bootstrap }} is reachable by IP because its certificate carries IP
+# SANs - Quad9's does not, which is why it cannot be used here.
+bootstrapDns:
+  - upstream: {{ blocky_bootstrap }}
+
+# We neither advertise nor route IPv6 to clients, so an AAAA upstream path
+# would only produce answers with no return route.
+connectIPVersion: v4
+
+blocking:
+  denylists:
+{% for name, urls in blocky_denylists.items() %}
+    {{ name }}:
+{% for u in urls %}
+      - {{ u }}
+{% endfor %}
+{% endfor %}
+  clientGroupsBlock:
+    default: [{{ blocky_denylists.keys() | join(', ') }}]
+  # zeroIp, not nxDomain: a blocked malware domain answering 0.0.0.0 fails the
+  # connection instantly, where NXDOMAIN sends some clients hunting through
+  # their remaining search domains.
+  blockType: zeroIp
+  blockTTL: {{ blocky_block_ttl }}
+  loading:
+    refreshPeriod: {{ blocky_list_refresh }}
+    downloads:
+      timeout: 60s
+      attempts: 5
+      cooldown: 10s
+    concurrency: 4
+    # `fast` = serve DNS immediately and apply lists once they arrive. A hotel
+    # captive portal has to be completed BEFORE any list can be downloaded, so
+    # a strategy that waits for them deadlocks on arrival at every venue.
+    strategy: fast
+    maxErrorsPerSource: 5
+
+caching:
+  minTime: 5m
+  maxTime: 30m
+  prefetching: true
+
+log:
+  level: {{ blocky_log_level }}
+  format: text
+  timestamp: true
+  # Truncates domains and client IPs in the logs. journald on this box is
+  # readable by anyone who gets a shell, and the log is a browsing history.
+  privacy: true
+
+# No query log, no metrics endpoint, no HTTP API. This box goes to
+# conferences; every one of those is an admin surface or a history file.
+queryLog:
+  type: none
+
+# Tell clients WHY a name was blocked, rather than leaving them to debug a
+# black hole. Extended DNS Errors are advisory and carry no extra data.
+ede:
+  enable: true

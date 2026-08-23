@@ -1,4 +1,13 @@
 # Base dnsmasq policy. Managed by Ansible.
+#
+# dnsmasq is a DHCP SERVER ONLY. blocky owns :53 - it does the blocklists and
+# the DoH that dnsmasq cannot. Nothing here may bind a DNS port.
+#
+# Known loss: DHCP lease names stop resolving, because the resolver that knows
+# the leases is no longer the resolver clients ask. To undo the whole cutover:
+# stop blocky, delete this line, restart dnsmasq.
+port=0
+
 log-facility=/var/log/dnsmasq.log
 conf-dir=/etc/dnsmasq.d
 domain-needed

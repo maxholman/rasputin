@@ -82,7 +82,8 @@ RaspAP's **conflicting dnsmasq fragments are always removed**, regardless of
 `090_raspap.conf` and our `10-base.conf` both set `log-facility`, which dnsmasq
 rejects outright as `illegal repeated keyword`, and `090_wlan1.conf` duplicates
 our `wlan1` dhcp-range. Left in place, dnsmasq refuses to start at all.
-`090_adblock.conf` and `099-upstream.conf` don't conflict and are left alone.
+`090_adblock.conf` and `099-upstream.conf` don't conflict and are left alone —
+they are also inert now that dnsmasq no longer answers DNS at all.
 
 `ap_passphrase` is undefined on purpose, so `hostapd.conf` is left alone and
 your AP keeps its current config and clients. Vault it to manage the AP:
@@ -101,8 +102,10 @@ validated with `nft -c` before it is ever loaded.
 
     input    policy drop  - established/related, loopback, some ICMP,
                             DHCP+DNS from LAN legs, SSH from admin legs
-    forward  policy drop  - LAN -> uplink, LAN <-> LAN, replies inbound
-    nat      masquerade on the current uplink
+    forward  policy drop  - LAN -> egress, LAN <-> LAN, replies inbound
+    output   policy drop  - ONLY when the profile requires a tunnel: wg0, LAN,
+                            loopback, the WireGuard handshake, DHCP renewal
+    nat      masquerade on the current egress
 
 Nothing is accepted inbound on the uplink. On a travel router the uplink is
 hostile by definition.
@@ -133,12 +136,54 @@ matched first) — it's the *next* connection that would fail. Confirm from a
 
 ## DNS
 
-- dnsmasq serves DHCP+DNS on LAN legs only. `bind-dynamic` +
-  `except-interface` are load-bearing: `interface=` alone leaves a wildcard
-  socket open, which would make this an open resolver on hotel wifi.
-- Clients are handed public resolvers by DHCP option 6, so they resolve even
-  when this box's own upstream is broken.
-- The box's own upstream is still `099-upstream.conf` — unmanaged, see below.
+**blocky owns `:53`. dnsmasq is a DHCP server only** (`port=0`).
+
+- Blocklist is **security-only** — malware, phishing, ransomware, scam,
+  cryptojacking (HaGeZi TIF Medium, ~360k domains). Ads, adult and gambling are
+  deliberately *not* blocked; ad blocking happens on-device.
+- Every upstream query leaves over **DoH**, in every profile. Quad9 first
+  (it filters malicious domains itself, so it is a second opinion rather than a
+  duplicate of the list), Cloudflare as the fallback for venues that block it.
+- Quad9 is given by hostname because **its certificate has no IP SANs**.
+  Bootstrapping it needs an IP-addressed DoH endpoint, which is what
+  `blocky_bootstrap` (`https://1.1.1.1/dns-query`) is for. There is no
+  plaintext DNS path anywhere, including bootstrap.
+- Clients are handed **this box and nothing else** by DHCP option 6. A public
+  secondary would be a standing bypass around the blocklist, the DoH upstream
+  and the kill switch.
+- The box resolves through blocky too — `/etc/resolv.conf` is pinned to
+  `127.0.0.1`, and `DNS =` is stripped from `wg0.conf` so wg-quick cannot
+  point it at Proton behind blocky's back.
+- Listen addresses are **specific, never `0.0.0.0`**. The input chain already
+  refuses `:53` from the uplink, but `netmode rollback-fire` deletes that whole
+  table — a wildcard bind would turn the lockout insurance into an open
+  resolver on the venue's wifi. `netmode` rewrites `20-listen.yml` per mode.
+
+**Known loss:** DHCP lease names no longer resolve. The resolver that knows the
+leases is no longer the resolver clients ask.
+
+### DoH listener
+
+Wired up but **off** until `blocky_doh_cert` and `blocky_doh_key` are defined —
+same guard as `ap_passphrase`. Proven to work (HTTP 200, TLS 1.3); the only
+missing piece is a certificate the client devices trust.
+
+### Kill switch
+
+Two halves, and the second one is new:
+
+- **forward** — clients cannot egress except via `wg0`. Proven end-to-end:
+  dropping `wg0` by hand gave 100% loss and zero leak.
+- **output** — *this box* cannot egress except via `wg0` either. Needed the
+  moment the resolver's upstream became a public DoH endpoint: previously the
+  upstream was `10.2.0.1`, routable only inside the tunnel, so a dead `wg0`
+  killed the router's own DNS by routing alone. That accident is gone, and
+  this rule replaces it. Disable with `killswitch_restrict_output: false`.
+
+  There is no bootstrap deadlock: the WireGuard peer is a literal IP, so the
+  tunnel needs neither DNS nor a correct clock. If the peer endpoint cannot be
+  read the chain **fails open with a loud warning** rather than stranding the
+  box — `netmode status` reports whether it is armed.
 
 ## Two guard rails, both earned
 
@@ -152,9 +197,7 @@ matched first) — it's the *next* connection that would fail. Confirm from a
 
 ## Known separate issues
 
-- `099-upstream.conf` sets `no-resolv` + `server=10.2.0.1` (Proton, inside the
-  WireGuard tunnel) and **there is no WireGuard interface**. Fail-closed DNS that
-  is currently just failing. Left untouched — it's a policy decision, not a bug.
-  DHCP clients are handed public resolvers directly so they don't depend on it.
+- `avahi-daemon` is enabled and announces this box on whatever network it can
+  reach. On a conference uplink that is an inventory leak. Not addressed here.
 - Captive portals at hotels/conferences still need a browser on the WAN side or
   a cloned MAC. Not solved here.

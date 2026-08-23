@@ -1,0 +1,18 @@
+# Which addresses the resolver answers on. Managed by netmode, which rewrites
+# this on every converge; Ansible writes it too so that a deploy with
+# converge_on_deploy=false still leaves a resolver that can bind.
+#
+# Specific addresses, never 0.0.0.0. The input chain already refuses :53 from
+# the uplink, but `netmode rollback-fire` DELETES that table - a wildcard bind
+# would turn the lockout insurance into an open resolver on the venue's wifi.
+# Keep this generator in step with write_blocky_listen() in netmode.
+ports:
+  dns: {{ blocky_listen_addrs | join(',') }}
+{% if blocky_doh_cert is defined and blocky_doh_key is defined %}
+  https: {{ blocky_listen_https | join(',') }}
+{% endif %}
+{% if blocky_doh_cert is defined and blocky_doh_key is defined %}
+certFile: {{ blocky_doh_cert }}
+keyFile: {{ blocky_doh_key }}
+minTlsServeVersion: "1.3"
+{% endif %}

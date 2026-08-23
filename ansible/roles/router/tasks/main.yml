@@ -228,3 +228,138 @@
     enabled: true
     masked: false      # hostapd ships masked on Debian/RPi OS; enable errors on it
   loop: [dnsmasq, hostapd, dhcpcd, netmode-converge]
+
+# --- resolver ---------------------------------------------------------------
+# Ordering here is the whole cutover. The binary is fetched while dnsmasq is
+# still answering DNS, because get_url runs ON the Pi and needs to resolve
+# github.com; only then is dnsmasq demoted and blocky given the port.
+
+- name: Create the blocky system user
+  ansible.builtin.user:
+    name: "{{ blocky_user }}"
+    system: true
+    shell: /usr/sbin/nologin
+    home: /var/lib/blocky
+    create_home: false
+
+- name: Create blocky config directory
+  ansible.builtin.file:
+    path: /etc/blocky/config.d
+    state: directory
+    mode: "0755"
+
+- name: Check the installed blocky version
+  ansible.builtin.command: /usr/local/bin/blocky version
+  register: _blocky_installed
+  changed_when: false
+  failed_when: false
+
+# Pinned by checksum, not just by tag: a release tag can be moved, and this
+# binary is the box's only resolver.
+- name: Download blocky
+  ansible.builtin.get_url:
+    url: "https://github.com/0xERR0R/blocky/releases/download/{{ blocky_version }}/blocky_{{ blocky_version }}_Linux_arm64.tar.gz"
+    dest: /tmp/blocky.tar.gz
+    checksum: "sha256:{{ blocky_sha256 }}"
+    mode: "0600"
+  when: blocky_version not in (_blocky_installed.stdout | default(''))
+
+- name: Install blocky
+  ansible.builtin.unarchive:
+    src: /tmp/blocky.tar.gz
+    dest: /usr/local/bin
+    remote_src: true
+    include: [blocky]
+    owner: root
+    group: root
+    mode: "0755"
+  when: blocky_version not in (_blocky_installed.stdout | default(''))
+  notify: restart blocky
+
+- name: Remove the blocky tarball
+  ansible.builtin.file:
+    path: /tmp/blocky.tar.gz
+    state: absent
+
+- name: Base resolver policy
+  ansible.builtin.template:
+    src: blocky-10-base.yml.j2
+    dest: /etc/blocky/config.d/10-base.yml
+    mode: "0644"
+  notify: restart blocky
+
+# netmode rewrites this on every converge. Written here as well so a deploy
+# with converge_on_deploy=false still leaves a resolver that can bind - the
+# same reason the eth0-LAN snippet is installed rather than merely staged.
+- name: Resolver listen addresses for the current mode
+  ansible.builtin.template:
+    src: blocky-20-listen.yml.j2
+    dest: /etc/blocky/config.d/20-listen.yml
+    mode: "0644"
+  vars:
+    blocky_listen_addrs: "{{ ['127.0.0.1:53', ap_subnet ~ '.1:53'] + ([eth_subnet ~ '.1:53'] if effective_mode == 'serve' else []) }}"
+    blocky_listen_https: "{{ [ap_subnet ~ '.1:' ~ blocky_doh_port] + ([eth_subnet ~ '.1:' ~ blocky_doh_port] if effective_mode == 'serve' else []) }}"
+  notify: restart blocky
+
+- name: blocky unit
+  ansible.builtin.template:
+    src: blocky.service.j2
+    dest: /etc/systemd/system/blocky.service
+    mode: "0644"
+  notify:
+    - reload systemd
+    - restart blocky
+
+# wg-quick applies "DNS =" from wg0.conf by rewriting /etc/resolv.conf, which
+# would send the box's OWN lookups to Proton's resolver and straight past
+# blocky - no blocklist, no DoH. The tunnel does not need it: clients are told
+# their resolver by DHCP, and this box is told by resolv.conf below.
+- name: Stop wg-quick hijacking the box's resolver
+  ansible.builtin.replace:
+    path: "/etc/wireguard/{{ vpn_interface }}.conf"
+    regexp: '^DNS\s*=.*$'
+    replace: '# DNS = removed by rasputin: this box resolves via blocky on 127.0.0.1'
+  failed_when: false
+
+- name: Point the box at its own resolver
+  ansible.builtin.copy:
+    dest: /etc/resolv.conf
+    mode: "0644"
+    content: |
+      # Managed by rasputin. This box resolves through blocky like any client,
+      # so its own lookups are filtered and leave over DoH.
+      nameserver 127.0.0.1
+      options timeout:2 attempts:2
+
+# THE CUTOVER. Everything above is inert until dnsmasq lets go of :53.
+- name: Apply the pending dnsmasq and blocky changes now
+  ansible.builtin.meta: flush_handlers
+
+# dnsmasq uses bind-dynamic, so it holds the specific LAN addresses rather
+# than a wildcard - but they are the exact addresses blocky needs, so it still
+# has to be gone before blocky starts.
+- name: Confirm nothing still holds port 53
+  ansible.builtin.shell: |
+    set -o pipefail
+    ss -lnup 'sport = :53'; ss -lntp 'sport = :53'
+  args: {executable: /bin/bash}
+  register: _port53
+  changed_when: false
+  failed_when: "'blocky' not in _port53.stdout and _port53.stdout is search(':53')"
+
+- name: Enable and start blocky
+  ansible.builtin.systemd:
+    name: blocky
+    enabled: true
+    state: started
+    daemon_reload: true
+
+# Proves the resolver actually resolves, rather than merely that systemd
+# thinks the unit is running.
+- name: Verify the resolver answers
+  ansible.builtin.command: /usr/local/bin/blocky healthcheck
+  register: _blocky_health
+  until: _blocky_health.rc == 0
+  retries: 10
+  delay: 3
+  changed_when: false
