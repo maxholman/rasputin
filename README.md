@@ -182,26 +182,37 @@ and will not send the intermediate on its own.
 
 ### Verifying the kill switch
 
-The forward half is proven. The **output half has not been exercised on real
-hardware** — it validates in a namespace and generates the right rules, but
-"wg0 dies and the router's own DoH query actually stops" is unconfirmed.
+**Both halves are proven on hardware.** Forward: dropping `wg0` gave clients
+100% loss and zero leak. Output, verified 2026-08-23 on `hotel-wifi` with the
+tunnel destroyed by `ip link del wg0`:
 
-Arm the auto-revert first; this drops all client traffic if it works:
+- blocky's upstream connections sat in **`SYN-SENT` to `1.1.1.1:443`** from the
+  venue address — the SYNs were generated and never left.
+- a counter rule appended to the output chain caught **38 packets / 2280 bytes**
+  falling through to `policy drop` on the uplink.
+- **no** ESTABLISHED connection to any resolver.
+- a client query returned `no servers could be reached`. DNS stopped rather
+  than resolving via the venue.
 
-    sudo systemd-run --unit=netmode-safety --on-active=300 /usr/local/sbin/netmode home
+To re-run it, arm the auto-revert first — this drops all client traffic:
+
+    sudo systemd-run --unit=netmode-safety --on-active=600 /usr/local/sbin/netmode home
     sudo systemd-run --unit=netmode-apply --collect /usr/local/sbin/netmode hotel-wifi
     netmode status                      # expect: output guard : policy drop
 
-    sudo wg-quick down wg0              # or: sudo ip link del wg0
-    # Expect ALL of:
-    #   - clients: 100% loss, no leak
-    #   - the box itself: no new :443 to 9.9.9.9 / 1.1.1.1 (ss -tnp | grep blocky)
-    #   - blocky healthcheck fails rather than answering via the venue
+    # instrument the drop path, then kill the tunnel
+    sudo nft add rule inet netmode output oifname \"wlan0\" counter comment \"leaktest\"
+    sudo ip link del wg0
+    sudo systemctl restart blocky       # force FRESH upstream connections
+    sudo nft list chain inet netmode output | grep leaktest
 
-    sudo /usr/local/sbin/netmode home   # or let the timer do it
+    sudo /usr/local/sbin/netmode home   # converge also wipes the counter rule
 
-`dig` is **not installed on the Pi** — use `blocky healthcheck` there, or query
-from a client.
+**`blocky healthcheck` still returns OK with the tunnel dead** — it only proves
+blocky is listening on `127.0.0.1:53`, not that it can resolve anything. Use an
+uncached client query to test upstream reachability.
+
+`dig` is **not installed on the Pi** — query from a client.
 
 ### Kill switch
 
