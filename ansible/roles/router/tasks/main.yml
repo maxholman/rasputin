@@ -191,6 +191,32 @@
     regexp: '^duid$'
     replace: '#duid  # rasputin: stable across MAC changes, defeats randomisation'
 
+# --- DoH certificate ---------------------------------------------------------
+# Must come before netmode is templated: netmode generates blocky's listen
+# file, and whether that file has an https stanza depends on these two facts.
+
+- name: Look for the DoH certificate on the controller
+  ansible.builtin.stat:
+    path: "{{ blocky_doh_local_dir | expanduser }}/{{ item }}"
+  register: _doh_local
+  loop: [rasputin-fullchain.crt, rasputin.key]
+  delegate_to: localhost
+  become: false
+  changed_when: false
+
+# Both or neither. Turning the listener on with only half the material means
+# blocky fails to start, and there is no second resolver on this box.
+- name: Enable the DoH listener only when both cert and key exist
+  ansible.builtin.set_fact:
+    blocky_doh_cert: "{{ blocky_doh_dir }}/rasputin-fullchain.crt"
+    blocky_doh_key: "{{ blocky_doh_dir }}/rasputin.key"
+  when: _doh_local.results | map(attribute='stat.exists') | select | list | length == 2
+
+- name: Report that DoH is staying off
+  ansible.builtin.debug:
+    msg: "No cert at {{ blocky_doh_local_dir }} - DoH listener stays off, plain DNS only."
+  when: blocky_doh_cert is not defined
+
 - name: Install netmode
   ansible.builtin.template:
     src: netmode.j2
@@ -241,6 +267,38 @@
     shell: /usr/sbin/nologin
     home: /var/lib/blocky
     create_home: false
+
+- name: Create the DoH certificate directory
+  ansible.builtin.file:
+    path: "{{ blocky_doh_dir }}"
+    state: directory
+    owner: "{{ blocky_user }}"
+    group: "{{ blocky_user }}"
+    mode: "0750"
+  when: blocky_doh_cert is defined
+
+- name: Install the DoH chain
+  ansible.builtin.copy:
+    src: "{{ blocky_doh_local_dir | expanduser }}/rasputin-fullchain.crt"
+    dest: "{{ blocky_doh_cert }}"
+    owner: "{{ blocky_user }}"
+    group: "{{ blocky_user }}"
+    mode: "0444"
+  when: blocky_doh_cert is defined
+  notify: restart blocky
+
+# The leaf key is the only private key that goes anywhere near this box. The
+# root and intermediate keys stay on the controller.
+- name: Install the DoH key
+  ansible.builtin.copy:
+    src: "{{ blocky_doh_local_dir | expanduser }}/rasputin.key"
+    dest: "{{ blocky_doh_key }}"
+    owner: "{{ blocky_user }}"
+    group: "{{ blocky_user }}"
+    mode: "0400"
+  when: blocky_doh_key is defined
+  no_log: true
+  notify: restart blocky
 
 - name: Create blocky config directory
   ansible.builtin.file:

@@ -164,21 +164,42 @@ leases is no longer the resolver clients ask.
 
 ### DoH listener
 
-Wired up but **off** until `blocky_doh_cert` and `blocky_doh_key` are defined —
-same guard as `ap_passphrase`. Proven end-to-end against a generated chain:
-HTTP 200 with full verification (`ssl_verify_result=0`), by hostname SAN and by
-IP SAN, TLS 1.3.
+**Live.** `https://10.9.141.1/dns-query` and `https://10.6.141.1/dns-query`,
+TLS 1.3, LAN legs only.
 
-Generate the certificate with `bin/make-doh-cert.sh <root.crt> <root.key>`:
-an EC P-256 "infra" intermediate (`pathlen:0`) under an existing root, then a
-leaf carrying **IP SANs for both LAN legs**. The IP SANs are load-bearing — a
-client asking this box to resolve names cannot resolve the box's own name
-first, so DoH has to work as `https://10.9.141.1/dns-query`.
+The trust anchor is a **dedicated root made for this box alone**
+(`bin/make-doh-cert.sh --new-root`) — deliberately not chained to any estate or
+employer CA. This router is carried into hostile networks; the anchor that
+vouches for it should vouch for nothing else. Root and intermediate keys live
+on the controller in `~/.rasputin-pki` and never reach the router; the leaf key
+is the only private key on the box.
 
-Both are long-lived on purpose. This box cannot reach a CA from a hotel, and a
-DoH listener whose certificate expired mid-trip is a router with no DNS.
-`certFile` must be the **fullchain** — blocky serves exactly what it is given
-and will not send the intermediate on its own.
+Install `~/.rasputin-pki/root-ca.crt` on each device that uses the AP.
+
+`blocky_doh_cert`/`blocky_doh_key` are **not** set in defaults. The role sets
+them only after finding the material on the controller, because a blocky
+pointed at a certificate that does not exist fails to start and there is no
+second resolver here.
+
+The leaf carries **IP SANs for both LAN legs**. That is load-bearing: a client
+asking this box to resolve names cannot resolve the box's own name first, so
+DoH has to work as `https://10.9.141.1/dns-query`. `certFile` is the
+**fullchain** — blocky serves exactly what it is given and will not send the
+intermediate on its own.
+
+Both certs are long-lived on purpose. This box cannot reach a CA from a hotel,
+and a DoH listener whose certificate expired mid-trip is a router with no DNS.
+
+Opening the listener is **two** changes, not one: binding the port and opening
+it in the input chain. netmode adds `tcp dport 443` for LAN legs only when the
+cert vars are defined. Without that rule the port is bound but every client
+sees a dead connection — which is exactly how this first failed.
+
+Verify from a client:
+
+    curl --cacert ~/.rasputin-pki/root-ca.crt \
+      -H 'accept: application/dns-message' \
+      "https://10.6.141.1/dns-query?dns=AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB"
 
 ### Verifying the kill switch
 

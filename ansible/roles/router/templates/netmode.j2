@@ -196,6 +196,12 @@ table inet netmode {
     # DHCP + DNS: LAN legs only. Never an open resolver on the venue's wifi.
     iifname @lan_ifaces udp dport { 67, 53 } accept
     iifname @lan_ifaces tcp dport 53 accept
+{% if blocky_doh_cert is defined and blocky_doh_key is defined %}
+    # DoH, under exactly the same LAN-only rule as plain DNS. Binding the
+    # listener is not enough - without this the input policy silently drops it
+    # and the port looks open from the box but dead from every client.
+    iifname @lan_ifaces tcp dport {{ blocky_doh_port }} accept
+{% endif %}
 
     # DHCP client on the uplink. dhcpcd's initial handshake uses AF_PACKET and
     # bypasses netfilter, but broadcast replies and its UDP fallback do not.
