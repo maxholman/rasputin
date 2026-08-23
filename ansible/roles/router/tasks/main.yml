@@ -58,13 +58,22 @@
   failed_when: false
   changed_when: false
 
-- name: Resolve the effective mode
+- name: Read the declared profile
   ansible.builtin.set_fact:
-    effective_mode: "{{ (_mode_file.content | b64decode | trim) if (_mode_file.content is defined) else default_mode }}"
+    _declared: "{{ (_mode_file.content | b64decode | trim) if (_mode_file.content is defined) else default_mode }}"
+
+# /etc/netmode/mode holds a PROFILE name now, not a raw mode. Comparing it
+# directly against 'serve' meant the profile 'home' - which IS serve - looked
+# like an uplink, and the eth0 DHCP config was deleted out from under a
+# downstream network that depends on it. Resolve through the same profile map
+# netmode uses, so the two can never disagree.
+- name: Resolve the profile to a mode
+  ansible.builtin.set_fact:
+    effective_mode: "{{ netmode_profiles[_declared].mode if (_declared in netmode_profiles) else _declared }}"
 
 - name: Show which mode config is being applied for
   ansible.builtin.debug:
-    msg: "effective mode = {{ effective_mode }} (seed default_mode = {{ default_mode }})"
+    msg: "declared profile = {{ _declared }} -> effective mode = {{ effective_mode }}"
 
 - name: Base dnsmasq policy
   ansible.builtin.template:

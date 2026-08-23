@@ -400,7 +400,7 @@ converge() {
   fi
   sleep 2
   assert_sane "$mode"
-  echo "netmode: converged to '$mode' (uplink=$uplink)"
+  echo "netmode: converged to '$profile' (mode=$mode uplink=$uplink egress=$([[ $VPN == 1 ]] && echo "$VPN_IF" || echo "$uplink"))"
 }
 
 status() {
@@ -412,7 +412,7 @@ status() {
   echo "lan snippet   : $([[ -f $LAN_SNIPPET ]] && echo present || echo absent)"
   echo "default route : $(ip route show default | tr '\n' ';' || echo none)"
   echo "masquerade    : $(nft -a list chain inet netmode postrouting 2>/dev/null | grep -o 'oifname "[a-z0-9]*" masquerade' || echo none)"
-  echo "admin ifaces  : $(nft list set inet netmode admin_ifaces 2>/dev/null | grep -o 'elements = {.*}' || echo none)"
+  echo "admin ifaces  : $(nft list set inet netmode admin_ifaces 2>/dev/null | tr -d '\n' | grep -oE 'elements = \{[^}]*\}' | tr -s ' ' || echo '<none - admin plane NOT restricted or table absent>')"
 }
 
 mkdir -p "$STATE_DIR"
