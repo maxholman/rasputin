@@ -165,8 +165,43 @@ leases is no longer the resolver clients ask.
 ### DoH listener
 
 Wired up but **off** until `blocky_doh_cert` and `blocky_doh_key` are defined —
-same guard as `ap_passphrase`. Proven to work (HTTP 200, TLS 1.3); the only
-missing piece is a certificate the client devices trust.
+same guard as `ap_passphrase`. Proven end-to-end against a generated chain:
+HTTP 200 with full verification (`ssl_verify_result=0`), by hostname SAN and by
+IP SAN, TLS 1.3.
+
+Generate the certificate with `bin/make-doh-cert.sh <root.crt> <root.key>`:
+an EC P-256 "infra" intermediate (`pathlen:0`) under an existing root, then a
+leaf carrying **IP SANs for both LAN legs**. The IP SANs are load-bearing — a
+client asking this box to resolve names cannot resolve the box's own name
+first, so DoH has to work as `https://10.9.141.1/dns-query`.
+
+Both are long-lived on purpose. This box cannot reach a CA from a hotel, and a
+DoH listener whose certificate expired mid-trip is a router with no DNS.
+`certFile` must be the **fullchain** — blocky serves exactly what it is given
+and will not send the intermediate on its own.
+
+### Verifying the kill switch
+
+The forward half is proven. The **output half has not been exercised on real
+hardware** — it validates in a namespace and generates the right rules, but
+"wg0 dies and the router's own DoH query actually stops" is unconfirmed.
+
+Arm the auto-revert first; this drops all client traffic if it works:
+
+    sudo systemd-run --unit=netmode-safety --on-active=300 /usr/local/sbin/netmode home
+    sudo systemd-run --unit=netmode-apply --collect /usr/local/sbin/netmode hotel-wifi
+    netmode status                      # expect: output guard : policy drop
+
+    sudo wg-quick down wg0              # or: sudo ip link del wg0
+    # Expect ALL of:
+    #   - clients: 100% loss, no leak
+    #   - the box itself: no new :443 to 9.9.9.9 / 1.1.1.1 (ss -tnp | grep blocky)
+    #   - blocky healthcheck fails rather than answering via the venue
+
+    sudo /usr/local/sbin/netmode home   # or let the timer do it
+
+`dig` is **not installed on the Pi** — use `blocky healthcheck` there, or query
+from a client.
 
 ### Kill switch
 
