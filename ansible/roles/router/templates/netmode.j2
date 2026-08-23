@@ -75,19 +75,50 @@ apply_firewall() {
   # Never accept Router Advertisements on a hostile uplink: a spoofed RA
   # installs an IPv6 default route + RDNSS, and RFC 6724 makes IPv6 win over
   # our IPv4 path. This is the highest-value attack on this box at a venue.
+  # all/default matter as much as the uplink: with them left at 1 a rogue
+  # client on our OWN LAN can RA us a default route. Demonstrated, not theory.
+  sysctl -qw net.ipv6.conf.all.accept_ra=0 2>/dev/null || true
+  sysctl -qw net.ipv6.conf.default.accept_ra=0 2>/dev/null || true
+  sysctl -qw net.ipv6.conf.all.autoconf=0 2>/dev/null || true
   sysctl -qw "net.ipv6.conf.${uplink}.accept_ra=0" 2>/dev/null || true
   sysctl -qw "net.ipv6.conf.${uplink}.autoconf=0" 2>/dev/null || true
+  # We do not advertise IPv6 to clients, so forwarding it would only create
+  # a path with no return route. Explicit beats inherited.
+  sysctl -qw net.ipv6.conf.all.forwarding=0 2>/dev/null || true
 
   # The venue's own subnet and gateway. Clients must not reach other guests,
   # but MUST still reach the gateway itself or captive-portal login is
   # impossible - portals almost always sit on a private address there.
   local upnet upgw lateral=""
-  upnet=$(ip -4 -o addr show dev "$uplink" 2>/dev/null | awk '{print $4}' | head -1)
-  upgw=$(ip -4 route show default dev "$uplink" 2>/dev/null | awk '{print $3}' | head -1)
+  # Wait for the uplink to actually have an address. apply_firewall runs
+  # milliseconds after dhcpcd is bounced, so without this the lookups return
+  # empty on the COMMON path and every anti-lateral rule silently vanishes.
+  local _i
+  for _i in $(seq 1 15); do
+    upnet=$(ip -4 -o addr show dev "$uplink" 2>/dev/null | awk '{print $4}' | head -1)
+    [[ -n "$upnet" ]] && break
+    sleep 1
+  done
+  # "$3" is the gateway only for "default via X dev Y". On a point-to-point
+  # uplink (LTE/tether: "default dev wwan0 scope link") $3 is the INTERFACE
+  # NAME, which nft then tries to resolve as a hostname and the load fails.
+  upgw=$(ip -4 route show default dev "$uplink" 2>/dev/null \
+         | awk '{for(i=1;i<=NF;i++) if($i=="via") {print $(i+1); exit}}')
   if [[ -n "$upnet" ]]; then
-    [[ -n "$upgw" ]] && lateral="    iifname @lan_ifaces oifname \"$uplink\" ip daddr $upgw accept
+    if [[ -n "$upgw" ]]; then
+      # Only the ports a captive portal needs. A blanket accept here would let
+      # SMB and mDNS reach the venue's own gateway - the exact inventory leak
+      # the discovery drops below exist to prevent.
+      lateral="    iifname @lan_ifaces oifname \"$uplink\" ip daddr $upgw tcp dport { 80, 443 } accept
+    iifname @lan_ifaces oifname \"$uplink\" ip daddr $upgw udp dport 53 accept
+    iifname @lan_ifaces oifname \"$uplink\" ip daddr $upgw tcp dport 53 accept
 "
+    else
+      echo "netmode: WARNING - no gateway on $uplink; captive portals will be unreachable" >&2
+    fi
     lateral="${lateral}    iifname @lan_ifaces oifname \"$uplink\" ip daddr $upnet drop"
+  else
+    echo "netmode: WARNING - $uplink has no address; venue-lateral rules NOT installed" >&2
   fi
   cat > "$STATE_DIR/ruleset.nft" <<NFT
 table inet netmode
@@ -111,7 +142,8 @@ table inet netmode {
 
     # Answer pings only on our own LANs. On the venue's network we stay dark.
     iifname @lan_ifaces icmp type echo-request accept
-    iifname @lan_ifaces icmpv6 type { echo-request, nd-router-solicit, nd-router-advert } accept
+    # nd-router-advert accepted NOWHERE: we are the router, we are never told a route.
+    iifname @lan_ifaces icmpv6 type { echo-request, nd-router-solicit } accept
     # NOTE: nd-router-advert is deliberately NOT accepted on the uplink.
 
     # DHCP + DNS: LAN legs only. Never an open resolver on the venue's wifi.
@@ -120,7 +152,7 @@ table inet netmode {
 
     # DHCP client on the uplink. dhcpcd's initial handshake uses AF_PACKET and
     # bypasses netfilter, but broadcast replies and its UDP fallback do not.
-    iifname "$uplink" udp sport 67 dport 68 accept
+    iifname "$uplink" udp sport 67 udp dport 68 accept
 
     # Admin plane.
     iifname @admin_ifaces tcp dport 22 accept
@@ -129,17 +161,20 @@ table inet netmode {
 
   chain forward {
     type filter hook forward priority 0; policy drop;
+    # MUST sit above the ct rule: the server's SYN-ACK is already ESTABLISHED,
+    # so below it only the client's SYN gets clamped and the return direction
+    # stays unclamped - half-fixing the blackhole this exists to prevent.
+    tcp flags syn tcp option maxseg size set rt mtu
     ct state established,related accept
     ct state invalid drop
-    # Without this, clients complete TCP handshakes then stall on the first
-    # large response behind PPPoE/captive portals - and always behind WireGuard.
-    tcp flags syn tcp option maxseg size set rt mtu
     # Lateral movement: reach the venue gateway (captive portal) but not the
     # other guests sharing that subnet.
 $lateral
     iifname @lan_ifaces oifname "$uplink" ip daddr 169.254.0.0/16 drop
 
-    # Local-discovery chatter must not leak our client inventory to the venue.
+    # Unicast discovery only. Multicast never enters the forward hook at all
+    # (no multicast routing), so these catch unicast mDNS/SSDP/NetBIOS - a
+    # narrower leak than it looks, but a real one.
     iifname @lan_ifaces oifname "$uplink" udp dport { 5353, 5355, 1900, 137, 138 } drop
     iifname @lan_ifaces oifname "$uplink" tcp dport { 139, 445 } drop
 
