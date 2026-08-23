@@ -2,4 +2,8 @@
 - name: Travel router
   hosts: pi_router
   become: true
+  # Config is removed in tasks but restored in handlers. Without this, an abort
+  # partway leaves the old config deleted and the new config never applied -
+  # which is exactly how a failed run left eth0 with no DHCP on disk.
+  force_handlers: true
   roles: [router]

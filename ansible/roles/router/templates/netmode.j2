@@ -22,7 +22,7 @@ DHCPCD=/etc/dhcpcd.conf
 BEGIN='# >>> netmode managed >>>'
 END='# <<< netmode managed <<<'
 
-die() { echo "netmode: $*" >&2; exit 1; }
+die() { printf 'netmode: %b\n' "$*" >&2; exit 1; }
 [[ $EUID -eq 0 ]] || die "must run as root"
 
 # --- the declared state ----------------------------------------------------
@@ -66,7 +66,7 @@ apply_firewall() {
   local uplink="$1" mode="$2" lan_list admin_list
   if [[ $mode == serve ]]; then lan_list="\"$ETH\", \"$AP\""; else lan_list="\"$AP\""; fi
   admin_list="$lan_list"
-{% if admin_on_uplink | default(false) %}
+{% if admin_on_uplink | default(false) | bool %}
   admin_list="$admin_list, \"$uplink\""   # admin_on_uplink=true: EXPOSES SSH TO THE VENUE
 {% endif %}
 
@@ -90,6 +90,10 @@ table inet netmode {
     iifname @lan_ifaces udp dport { 67, 53 } accept
     iifname @lan_ifaces tcp dport 53 accept
 
+    # DHCP client on the uplink. dhcpcd's initial handshake uses AF_PACKET and
+    # bypasses netfilter, but broadcast replies and its UDP fallback do not.
+    iifname "$uplink" udp sport 67 dport 68 accept
+
     # Admin plane.
     iifname @admin_ifaces tcp dport 22 accept
     # everything else, notably anything arriving on the uplink, hits policy drop
@@ -99,6 +103,9 @@ table inet netmode {
     type filter hook forward priority 0; policy drop;
     ct state established,related accept
     ct state invalid drop
+    # Without this, clients complete TCP handshakes then stall on the first
+    # large response behind PPPoE/captive portals - and always behind WireGuard.
+    tcp flags syn tcp option maxseg size set rt mtu
     iifname @lan_ifaces oifname "$uplink" accept
     iifname @lan_ifaces oifname @lan_ifaces accept
     # uplink -> LAN is only ever reply traffic, matched by the ct rule above
@@ -112,7 +119,10 @@ table inet netmode {
 NFT
 
   # Validate before loading. A bad ruleset must never reach the kernel.
-  nft -c -f "$STATE_DIR/ruleset.nft" || die "nftables ruleset invalid; firewall unchanged"
+  if ! nft -c -f "$STATE_DIR/ruleset.nft"; then
+    echo "netmode: nftables ruleset invalid; firewall unchanged" >&2
+    return 1
+  fi
   nft -f "$STATE_DIR/ruleset.nft"
 }
 
@@ -135,22 +145,46 @@ assert_sane() {
 # timer that tears the firewall back down; `netmode confirm` cancels it.
 schedule_rollback() {
   local secs="$1"
+  # Must be whole seconds. "--rollback 5m" would otherwise reach systemd as
+  # --on-active=5ms and revert the firewall before it had finished applying.
+  case "$secs" in ''|*[!0-9]*) die "--rollback takes whole seconds, got: $secs" ;; esac
+  [ "$secs" -ge 30 ] || die "--rollback must be at least 30s, got: $secs"
+
+  # A pending timer would make systemd-run fail on the unit name, aborting a
+  # converge that has already rewritten dhcpcd and dnsmasq.
+  systemctl stop netmode-rollback.timer 2>/dev/null || true
+  systemctl reset-failed netmode-rollback.service 2>/dev/null || true
+  rm -f "$STATE_DIR/rollback-fired"
+
   systemd-run --quiet --unit=netmode-rollback --on-active="${secs}s" \
-    /usr/sbin/nft delete table inet netmode \
+    /usr/local/sbin/netmode rollback-fire \
     || die "could not schedule rollback; refusing to change the firewall blind"
   echo "netmode: firewall rolls back in ${secs}s - run 'netmode confirm' to keep it"
 }
 
+# Runs from the timer. Leaves a marker so `confirm` can distinguish "never
+# armed" from "already fired and destroyed your firewall".
+rollback_fire() {
+  nft delete table inet netmode 2>/dev/null || true
+  date -Is > "$STATE_DIR/rollback-fired"
+  echo "netmode: ROLLBACK FIRED - firewall removed" >&2
+}
+
 cancel_rollback() {
+  if [[ -f "$STATE_DIR/rollback-fired" ]]; then
+    echo "netmode: ROLLBACK ALREADY FIRED at $(cat "$STATE_DIR/rollback-fired")" >&2
+    echo "netmode: the firewall was removed. Re-run 'netmode $(cat "$STATE" 2>/dev/null || echo serve)' to restore it." >&2
+    return 1
+  fi
   if systemctl stop netmode-rollback.timer 2>/dev/null; then
     echo "netmode: rollback cancelled, ruleset kept"
   else
-    echo "netmode: no rollback pending"
+    echo "netmode: no rollback was pending"
   fi
 }
 
 converge() {
-  local mode; mode=$(cat "$STATE")
+  local mode; mode=$(cat "$STATE" 2>/dev/null) || die "no declared mode at $STATE - run: netmode serve|uplink"
   [[ $mode == serve || $mode == uplink ]] || die "bad declared mode: $mode"
   local uplink; [[ $mode == serve ]] && uplink="$WIFI" || uplink="$ETH"
 
@@ -173,7 +207,10 @@ converge() {
   systemctl restart dnsmasq
 
   [[ -n "${ROLLBACK:-}" ]] && schedule_rollback "$ROLLBACK"
-  apply_firewall "$uplink" "$mode"
+  if ! apply_firewall "$uplink" "$mode"; then
+    systemctl stop netmode-rollback.timer 2>/dev/null || true
+    die "firewall apply failed; rollback disarmed, previous ruleset left intact"
+  fi
   sleep 2
   assert_sane "$mode"
   echo "netmode: converged to '$mode' (uplink=$uplink)"
@@ -207,6 +244,7 @@ case "$cmd" in
   uplink|wan)  echo uplink > "$STATE"; converge ;;
   converge) converge ;;
   confirm)  cancel_rollback ;;
+  rollback-fire) rollback_fire ;;
   status)   status ;;
   *) die "usage: netmode {serve|uplink|converge|confirm|status} [--rollback SECS]\n  serve  = eth0 FEEDS the wired net (this is UniFi WAN)\n  uplink = eth0 TAKES an address from the venue" ;;
 esac

@@ -8,12 +8,16 @@
 
 # hostapd has no offline config-test mode, so this restarts and then confirms
 # it actually came up rather than assuming success.
+# Both listen on the same topic: handlers fire individually otherwise, so the
+# verify step never ran and a hostapd that failed to start reported green.
 - name: restart hostapd
+  listen: hostapd changed
   ansible.builtin.systemd:
     name: hostapd
     state: restarted
 
 - name: verify hostapd came up
+  listen: hostapd changed
   ansible.builtin.command: systemctl is-active hostapd
   register: _hostapd
   failed_when: _hostapd.stdout.strip() != 'active'
