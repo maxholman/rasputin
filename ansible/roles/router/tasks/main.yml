@@ -37,6 +37,15 @@
   notify: restart dnsmasq
 
 # --- config ----------------------------------------------------------------
+- name: Create netmode directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - /usr/local/share/netmode
+    - /etc/netmode
+
 - name: Base dnsmasq policy
   ansible.builtin.template:
     src: 10-base.conf.j2
@@ -62,6 +71,19 @@
 # Skipped unless ap_passphrase is vaulted. Without this guard the run aborts on
 # an undefined variable - or worse, renders an empty passphrase and drops every
 # client currently associated to the AP.
+# Without this, a deploy with converge_on_deploy=false deletes RaspAP's
+# 090_eth0.conf and installs nothing in its place, because only `netmode
+# converge` installs the snippet. dnsmasq would then restart with no DHCP on
+# eth0 and every downstream WAN would lose its lease. netmode still owns this
+# file afterwards - it removes it when switching to uplink mode.
+- name: Install the eth0-LAN snippet when serving
+  ansible.builtin.template:
+    src: 30-eth0-lan.conf.j2
+    dest: /etc/dnsmasq.d/30-eth0-lan.conf
+    mode: "0644"
+  when: default_mode == 'serve'
+  notify: restart dnsmasq
+
 - name: hostapd config
   ansible.builtin.template:
     src: hostapd.conf.j2
