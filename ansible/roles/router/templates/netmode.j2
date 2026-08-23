@@ -446,6 +446,22 @@ converge() {
   # restart, never reload: a failed unit cannot be reloaded back to life.
   systemctl restart dnsmasq
 
+  # The listen addresses just changed with the mode and blocky binds them at
+  # startup, so without this it keeps answering on the addresses the PREVIOUS
+  # mode had - or, switching the other way, never binds the new one at all.
+  systemctl restart blocky
+  # dhcpcd may still be a second or two behind on the LAN address, and the unit
+  # retries on failure, so wait for a real answer instead of trusting
+  # is-active. A resolver that is "running" but not bound is the failure this
+  # box can least afford.
+  local _b
+  for _b in $(seq 1 20); do
+    /usr/local/bin/blocky healthcheck >/dev/null 2>&1 && break
+    sleep 1
+  done
+  /usr/local/bin/blocky healthcheck >/dev/null 2>&1 \
+    || echo "netmode: WARNING - blocky is not answering on 127.0.0.1:53" >&2
+
   [[ -n "${ROLLBACK:-}" ]] && schedule_rollback "$ROLLBACK"
   if ! apply_firewall "$uplink" "$mode" "$VPN"; then
     systemctl stop netmode-rollback.timer 2>/dev/null || true
