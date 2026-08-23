@@ -1,9 +1,13 @@
 ---
+# No update_cache: this box's own DNS is fail-closed (099-upstream.conf points
+# at a Proton resolver inside a WireGuard tunnel that isn't up), so apt cannot
+# resolve deb.debian.org and a refresh fails hard. With state=present and the
+# packages already installed, no network is needed at all. Re-enable the cache
+# refresh only once the Pi can resolve names.
 - name: Install router packages
   ansible.builtin.apt:
     name: [dnsmasq, hostapd, dhcpcd5, nftables]
     state: present
-    update_cache: true
 
 # --- RaspAP-ectomy (opt-in: -e purge_raspap=true) --------------------------
 # Only the web UI/daemon removal is opt-in; the config fragments above are not.
