@@ -359,6 +359,30 @@ reassociate_wifi() {
   echo "netmode: WARNING - $WIFI has no address after MAC change" >&2
 }
 
+AVAHI_CONF=/etc/avahi/avahi-daemon.conf
+
+# avahi announces this box - hostname, addresses, services - by multicast on
+# every interface it is allowed to use. On a venue uplink that is a free
+# inventory entry for anyone listening, and the firewall cannot help: these
+# are packets we SEND, and the output chain only clamps down when a tunnel is
+# up. Denying the venue-facing leg keeps .local working on our own AP while
+# staying silent where it matters.
+#
+# {{ wan_wifi_if }} is denied unconditionally - it is a hardware invariant that
+# it always faces the venue. {{ eth_if }} is denied only when it is the uplink.
+write_avahi_deny() {
+  local mode="$1" deny="$WIFI"
+  [[ $mode == uplink ]] && deny="$WIFI,$ETH"
+  [[ -f $AVAHI_CONF ]] || return 0
+  if grep -qE '^[[:space:]]*deny-interfaces=' "$AVAHI_CONF"; then
+    sed -i "s|^[[:space:]]*deny-interfaces=.*|deny-interfaces=$deny|" "$AVAHI_CONF"
+  else
+    sed -i "/^\[server\]/a deny-interfaces=$deny" "$AVAHI_CONF"
+  fi
+  systemctl restart avahi-daemon 2>/dev/null || true
+  echo "netmode: avahi silenced on $deny"
+}
+
 VPN_IF={{ vpn_interface }}
 BLOCKY_LISTEN=/etc/blocky/config.d/20-listen.yml
 
@@ -425,6 +449,7 @@ converge() {
   # so it must be built knowing whether wg0 exists.
   if [[ $VPN == 1 ]]; then vpn_start; else vpn_stop; fi
   write_blocky_listen "$mode"
+  write_avahi_deny "$mode"
 
 {% if randomize_client_mac | default(true) | bool %}
   # Whichever leg faces the venue gets a fresh identity on every converge -

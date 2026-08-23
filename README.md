@@ -123,6 +123,39 @@ role-based, not name-based, so it follows `eth0` when it changes job:
 `admin_on_uplink: true` overrides this and exposes SSH to the venue. It defaults
 to false and should stay there.
 
+## The AP
+
+WPA3-SAE **transition mode**: `wpa_key_mgmt=WPA-PSK SAE`. SAE clients get WPA3
+and are immune to the offline dictionary attack on a captured handshake — the
+actual threat at a hacker conference. WPA2-PSK stays advertised so older
+clients still associate.
+
+PMF is optional at the BSS (`ieee80211w=1`) because REQUIRED would lock out
+every WPA2-only client and defeat transition mode, but `sae_require_mfp=1`
+makes it mandatory for anyone who does use SAE — otherwise a WPA3 client can be
+steered down to unprotected management frames and deauthed.
+
+`sae_pwe=2` allows both hunt-and-peck and hash-to-element. H2E alone is
+stronger but is refused by some older SAE clients, who are exactly the
+population transition mode exists for.
+
+`rsn_pairwise=CCMP`, not `wpa_pairwise` — with `wpa=2` there is no WPA1 element
+for the latter to describe, so it was being ignored.
+
+The passphrase is **vaulted** (`group_vars/pi_router/vault.yml`). The vault key
+is `~/.rasputin-vault-pass`, outside the repo and referenced from
+`ansible.cfg`. Rotating it drops every associated client until they re-join.
+
+## avahi
+
+Not removed — **restricted**. avahi announces this box by multicast on every
+interface it may use, and no inbound firewall rule can stop it, because these
+are packets we *send*; the output chain only clamps down when a tunnel is up.
+
+`deny-interfaces` is set to whichever leg faces the venue: `wlan0` always (a
+hardware invariant), plus `eth0` in `uplink` mode. `.local` keeps working on
+the AP; the venue hears nothing. netmode rewrites it per mode.
+
 ### Don't lock yourself out
 
 Tightening this remotely can strand you at a conference. Use the rollback window:
@@ -264,7 +297,5 @@ Two halves, and the second one is new:
 
 ## Known separate issues
 
-- `avahi-daemon` is enabled and announces this box on whatever network it can
-  reach. On a conference uplink that is an inventory leak. Not addressed here.
 - Captive portals at hotels/conferences still need a browser on the WAN side or
   a cloned MAC. Not solved here.

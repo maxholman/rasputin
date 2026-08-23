@@ -1,3 +1,9 @@
 # vault / secrets
 group_vars/**/vault.yml
 *.retry
+
+# PKI and vault keys live outside the repo (~/.rasputin-pki,
+# ~/.rasputin-vault-pass). These patterns are a backstop, not the mechanism.
+*.key
+*.pem
+ap-passphrase.txt

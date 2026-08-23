@@ -12,11 +12,31 @@ ieee80211n=1
 ieee80211ac=1
 ieee80211ax=1
 wmm_enabled=1
+# Open System only. Shared Key is WEP-era and its inclusion would advertise a
+# downgrade path that nothing modern needs.
 auth_algs=1
 wpa=2
-wpa_key_mgmt=WPA-PSK
-wpa_pairwise=CCMP
+
+# WPA3-SAE transition mode. SAE-capable clients get WPA3 and are immune to the
+# offline dictionary attack that makes a captured WPA2 handshake worth
+# grinding - which is the whole threat model at a hacker conference. WPA2-PSK
+# stays advertised so older clients still associate.
+wpa_key_mgmt=WPA-PSK SAE
+
+# rsn_pairwise, not wpa_pairwise: with wpa=2 there is no WPA1 element for
+# wpa_pairwise to describe, so it was being ignored.
+rsn_pairwise=CCMP
+
+# PMF optional at the BSS level - REQUIRED would lock out every WPA2-only
+# client and defeat the point of transition mode.
 ieee80211w=1
+# ...but mandatory for anyone who does use SAE. Without this an attacker can
+# steer a WPA3 client down to unprotected management frames and deauth it.
+sae_require_mfp=1
+# Both hunt-and-peck and hash-to-element. H2E alone is the stronger choice but
+# is refused by some older SAE clients, which is exactly who transition mode
+# exists for.
+sae_pwe=2
 ignore_broadcast_ssid=0
 he_su_beamformer=1
 he_su_beamformee=1
@@ -28,5 +48,7 @@ he_oper_centr_freq_seg0_idx=42
 vht_oper_centr_freq_seg0_idx=42
 ht_capab=[HT40+][LDPC][SHORT-GI-20][SHORT-GI-40][TX-STBC][RX-STBC1][MAX-AMSDU-7935]
 vht_capab=[RXLDPC][SHORT-GI-80][TX-STBC-2BY1][RX-STBC-1][MAX-MPDU-11454][MAX-A-MPDU-LEN-EXP7]
-# Keep in ansible-vault, never in plaintext:
+# Vaulted - see group_vars/pi_router/vault.yml. Both keys carry the same
+# secret: wpa_passphrase serves the WPA2 clients, sae_password the WPA3 ones.
 wpa_passphrase={{ ap_passphrase }}
+sae_password={{ ap_passphrase }}

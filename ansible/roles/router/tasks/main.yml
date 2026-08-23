@@ -217,6 +217,27 @@
     msg: "No cert at {{ blocky_doh_local_dir }} - DoH listener stays off, plain DNS only."
   when: blocky_doh_cert is not defined
 
+# Baseline for a deploy that does not converge; netmode rewrites this per mode.
+# See write_avahi_deny() for why: these are packets we send, so no inbound
+# firewall rule can stop them reaching the venue.
+- name: Stop avahi announcing this box to the venue
+  community.general.ini_file:
+    path: /etc/avahi/avahi-daemon.conf
+    section: server
+    option: deny-interfaces
+    value: "{{ wan_wifi_if if effective_mode == 'serve' else wan_wifi_if ~ ',' ~ eth_if }}"
+    mode: "0644"
+    no_extra_spaces: true
+  register: _avahi
+  failed_when: false
+
+- name: Restart avahi
+  ansible.builtin.systemd:
+    name: avahi-daemon
+    state: restarted
+  when: _avahi.changed | default(false)
+  failed_when: false
+
 - name: Install netmode
   ansible.builtin.template:
     src: netmode.j2
