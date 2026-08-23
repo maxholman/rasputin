@@ -158,19 +158,29 @@
   notify: restart wpa_supplicant
 
 # Stop announcing ourselves to every venue's DHCP server. `hostname` sends
-# "raspberrypi"; `clientid` sends a stable identifier that survives MAC
-# randomisation and defeats the point of it entirely.
+# the literal string "raspberrypi" to every network we join.
 - name: Do not leak hostname to venue DHCP servers
   ansible.builtin.replace:
     path: /etc/dhcpcd.conf
     regexp: '^hostname$'
     replace: '#hostname   # rasputin: do not announce ourselves to venues'
 
-- name: Do not send a stable DHCP client identifier
+# `clientid` is CORRECT here and must stay. Per dhcpcd.conf(5) a bare
+# `clientid` derives the identifier from the hardware address, so it follows
+# MAC randomisation. The stable-identifier trap is `duid` (DUID-LLT/UUID),
+# which survives MAC changes and would defeat randomisation entirely.
+# There is no `noclientid` option - dhcpcd rejects it as "unknown option".
+- name: Keep the DHCP client identifier tied to the (randomised) MAC
   ansible.builtin.replace:
     path: /etc/dhcpcd.conf
-    regexp: '^clientid$'
-    replace: 'noclientid  # rasputin: a stable clientid would defeat MAC randomisation'
+    regexp: '^noclientid.*$'
+    replace: 'clientid'
+
+- name: Ensure no stable DUID overrides the MAC-derived clientid
+  ansible.builtin.replace:
+    path: /etc/dhcpcd.conf
+    regexp: '^duid$'
+    replace: '#duid  # rasputin: stable across MAC changes, defeats randomisation'
 
 - name: Install netmode
   ansible.builtin.template:
