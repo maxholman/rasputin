@@ -75,7 +75,14 @@ rollback window. Only appropriate once the ruleset is known good.
 | flag | default | effect |
 |---|---|---|
 | `converge_on_deploy` | `true` | apply mode+firewall at the end of the run |
-| `purge_raspap` | `false` | stop/disable RaspAP and delete its dnsmasq fragments |
+| `purge_raspap` | `false` | stop and disable the `raspapd` daemon and `lighttpd` web UI |
+
+RaspAP's **conflicting dnsmasq fragments are always removed**, regardless of
+`purge_raspap` — they are not optional. Verified with `dnsmasq --test`:
+`090_raspap.conf` and our `10-base.conf` both set `log-facility`, which dnsmasq
+rejects outright as `illegal repeated keyword`, and `090_wlan1.conf` duplicates
+our `wlan1` dhcp-range. Left in place, dnsmasq refuses to start at all.
+`090_adblock.conf` and `099-upstream.conf` don't conflict and are left alone.
 
 `ap_passphrase` is undefined on purpose, so `hostapd.conf` is left alone and
 your AP keeps its current config and clients. Vault it to manage the AP:

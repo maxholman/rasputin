@@ -6,6 +6,7 @@
     update_cache: true
 
 # --- RaspAP-ectomy (opt-in: -e purge_raspap=true) --------------------------
+# Only the web UI/daemon removal is opt-in; the config fragments above are not.
 - name: Stop and disable RaspAP services
   ansible.builtin.systemd:
     name: "{{ item }}"
@@ -15,7 +16,12 @@
   failed_when: false
   when: purge_raspap | default(false) | bool
 
-- name: Remove RaspAP-generated dnsmasq fragments
+# NOT optional. These cannot coexist with ours - verified with dnsmasq --test:
+# 090_raspap.conf and 10-base.conf both set log-facility, which dnsmasq rejects
+# as "illegal repeated keyword", and 090_wlan1.conf duplicates our wlan1
+# dhcp-range. Leaving them in place means dnsmasq refuses to start at all.
+# 090_adblock.conf and 099-upstream.conf are left alone; they don't conflict.
+- name: Remove conflicting RaspAP dnsmasq fragments
   ansible.builtin.file:
     path: "/etc/dnsmasq.d/{{ item }}"
     state: absent
@@ -25,7 +31,6 @@
     - 090_wlan1.conf
     - 090_eth0.conf
   notify: restart dnsmasq
-  when: purge_raspap | default(false) | bool
 
 # --- config ----------------------------------------------------------------
 - name: Base dnsmasq policy
