@@ -347,4 +347,15 @@ probes around the kill switch. Needs sudo on the Pi; it prompts, or takes
 ## Known separate issues
 
 - Captive portals at hotels/conferences still need a browser on the WAN side or
-  a cloned MAC. Not solved here.
+  a cloned MAC. Not solved here. On `hotel-*` profiles this is a chicken-and-egg:
+  converge refuses to complete until wg0 is up, and wg0 cannot handshake until
+  the portal is cleared. Clear it from a device joined directly to the venue
+  wifi, then clone that MAC onto wlan0. The status viewer flags the signature
+  (path up on :443, no reply from the external-ip probe).
+- dhcpcd → systemd-networkd migration: deliberately deferred to the next
+  rebuild (OS upgrade or fresh SD card), on the bench with keyboard access.
+  The sed surgery on dhcpcd.conf is a real wart, but it is debugged and the
+  whole stack - kill switch, DoH, MAC randomisation on brcmfmac - was proven
+  on hardware with dhcpcd in place; migrating live re-opens all of that for
+  zero functional gain. raspapd is masked, so nothing disables networkd at
+  boot anymore when the time comes.
