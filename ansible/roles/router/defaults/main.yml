@@ -61,10 +61,11 @@ netmode_profiles:
 
 vpn_interface: wg0
 
-# How long to wait for wlan0 to take an address after a MAC change. The old
-# 20s was not always enough and the converge logged "no address after MAC
-# change" while the interface was still associating.
-wifi_reassociate_timeout: 45
+# How long to wait for wlan0 to take an address after a MAC change. 20s was
+# not always enough mid-session, and 45s was not enough at cold boot (scan +
+# SAE + DHCP on brcmfmac): the boot converge burned the whole window and
+# skipped the venue-lateral rules.
+wifi_reassociate_timeout: 90
 
 blocky_user: blocky
 

@@ -294,8 +294,11 @@
     content: |
       [Unit]
       Description=Converge declared network mode
-      After=network-pre.target dhcpcd.service
-      Wants=network-pre.target
+      # After wpa_supplicant@wlan0: converge randomises the wlan0 MAC and then
+      # waits for reassociation - racing a cold-starting supplicant burned the
+      # whole reassociate window at boot and skipped the venue-lateral rules.
+      After=network-pre.target dhcpcd.service wpa_supplicant@wlan0.service
+      Wants=network-pre.target wpa_supplicant@wlan0.service
       [Service]
       Type=oneshot
       RemainAfterExit=yes
