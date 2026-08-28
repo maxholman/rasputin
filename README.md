@@ -306,6 +306,34 @@ Two halves, and the second one is new:
   read the chain **fails open with a loud warning** rather than stranding the
   box — `netmode status` reports whether it is armed.
 
+## Status viewer
+
+`tools/status/` is a laptop-side TUI (Rust, ratatui). Nothing is installed on
+the Pi - each tick it runs one batched script over ssh (ControlMaster makes a
+warm tick ~100 ms) and renders locally, so a hotel link carries bytes of text,
+not full-screen repaints.
+
+    cargo install --path tools/status
+    rasputin-status                # tries 10.6.141.1, then the AP leg
+    rasputin-status --once         # plain-text snapshot, for scripts
+
+The DNS probes run from the laptop against the Pi's LAN address on purpose:
+they exercise the input chain, the listener and the DoH upstream as a real
+client would. `blocky healthcheck` on the box only proves the loopback
+listener - it passes with the tunnel dead. The `upstream` row queries a
+nonce label blocky cannot have cached, forcing a live round trip through the
+DoH upstream: NXDOMAIN is healthy, SERVFAIL means blocky is up but its
+upstream (or the uplink) is dead.
+
+It judges state against the declared profile (`vpn:` in `netmode_profiles`).
+A green ✓ marks only a promised protection verified present (wg0 up, guard
+drop, on a `vpn: true` profile); a red ✗ marks a mismatch either way; an
+expected-down state renders neutral ("down · no VPN in this profile").
+Unknown profiles get facts with no judgement. The WAN section's gateway ping
+is skipped while the output chain is `policy drop`, so the viewer never
+probes around the kill switch. Needs sudo on the Pi; it prompts, or takes
+`--sudo-pass-file` for scripting.
+
 ## Two guard rails, both earned
 
 1. **Validate before restart.** Handlers run `dnsmasq --test` first. RaspAP wrote

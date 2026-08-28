@@ -1,0 +1,14 @@
+[package]
+name = "rasputin-status"
+version = "0.1.0"
+edition = "2021"
+description = "Read-only status viewer for the rasputin travel router, run from the admin laptop over SSH"
+
+# Single dependency on purpose. ratatui re-exports crossterm, so terminal
+# handling, events and drawing all come from one crate at one version.
+[dependencies]
+ratatui = "0.29"
+
+[profile.release]
+strip = true
+lto = true
