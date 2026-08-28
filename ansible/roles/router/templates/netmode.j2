@@ -401,8 +401,11 @@ resolve_profile() {
 
 vpn_start() {
   ip link show "$VPN_IF" >/dev/null 2>&1 && return 0
-  wg-quick up "$VPN_IF" >/dev/null 2>&1 \
-    || die "VPN required by this profile but failed to start; refusing to continue unprotected"
+  local out
+  # Keep wg-quick's output: it names the actual failure (bad key, unresolvable
+  # endpoint, missing conf) and there is nowhere else it gets logged.
+  out=$(wg-quick up "$VPN_IF" 2>&1) \
+    || die "VPN required by this profile but failed to start; refusing to continue unprotected\n$out"
   echo "netmode: $VPN_IF up"
 }
 
