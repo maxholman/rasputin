@@ -106,6 +106,12 @@ blocklist and the DoH upstream in one step. They are removed too.
 The `/etc/raspap*` trees themselves are left on disk — inert once the sudoers
 rule and both services are gone.
 
+The purge exposed a hidden boot dependency, found the hard way: raspapd's boot
+job was the only thing starting `wpa_supplicant` on wlan0, so the first reboot
+after masking it came up with the AP beaconing and a **dead WAN**. The role now
+enables `wpa_supplicant@wlan0.service` (config symlinked to
+`wpa_supplicant-wlan0.conf`) as the boot-time owner of the WAN association.
+
 `ap_passphrase` is undefined on purpose, so `hostapd.conf` is left alone and
 your AP keeps its current config and clients. Vault it to manage the AP:
 

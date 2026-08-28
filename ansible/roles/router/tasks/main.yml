@@ -41,6 +41,22 @@
     state: absent
   when: purge_raspap | bool
 
+# raspapd's boot job was, undocumented, the only thing starting wpa_supplicant
+# on wlan0. The first reboot after masking it came up with the AP beaconing
+# and a dead WAN - the whole house lost internet. The instance unit is the
+# boot-time owner now; netmode's MAC-randomise/reassociate flow needs a
+# running supplicant and provides nothing of its own.
+- name: Link the wlan0 supplicant config for the instance unit
+  ansible.builtin.file:
+    src: wpa_supplicant.conf
+    dest: /etc/wpa_supplicant/wpa_supplicant-wlan0.conf
+    state: link
+
+- name: Enable wpa_supplicant on the wifi WAN
+  ansible.builtin.systemd:
+    name: wpa_supplicant@wlan0
+    enabled: true
+
 # NOT optional. The 090_* ones cannot coexist with ours - verified with
 # dnsmasq --test: 090_raspap.conf and 10-base.conf both set log-facility, which
 # dnsmasq rejects as "illegal repeated keyword", and 090_wlan1.conf duplicates
