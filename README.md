@@ -75,15 +75,36 @@ rollback window. Only appropriate once the ruleset is known good.
 | flag | default | effect |
 |---|---|---|
 | `converge_on_deploy` | `true` | apply mode+firewall at the end of the run |
-| `purge_raspap` | `false` | stop and disable the `raspapd` daemon and `lighttpd` web UI |
+| `purge_raspap` | `true` | mask `raspapd`, disable the `lighttpd` web UI, remove the RaspAP sudoers drop-in |
 
-RaspAP's **conflicting dnsmasq fragments are always removed**, regardless of
-`purge_raspap` — they are not optional. Verified with `dnsmasq --test`:
-`090_raspap.conf` and our `10-base.conf` both set `log-facility`, which dnsmasq
-rejects outright as `illegal repeated keyword`, and `090_wlan1.conf` duplicates
-our `wlan1` dhcp-range. Left in place, dnsmasq refuses to start at all.
-`090_adblock.conf` and `099-upstream.conf` don't conflict and are left alone —
-they are also inert now that dnsmasq no longer answers DNS at all.
+RaspAP's **dnsmasq fragments are always removed**, regardless of `purge_raspap`
+— they are not optional. Verified with `dnsmasq --test`: `090_raspap.conf` and
+our `10-base.conf` both set `log-facility`, which dnsmasq rejects outright as
+`illegal repeated keyword`, and `090_wlan1.conf` duplicates our `wlan1`
+dhcp-range. Left in place, dnsmasq refuses to start at all. `090_adblock.conf`
+and the `099-upstream.conf` pair don't conflict, but they are inert *only*
+because `10-base.conf` sets `port=0` — drop `port=0` with `099-upstream.conf`
+present and dnsmasq resolves in plaintext to `1.1.1.1`, bypassing blocky, the
+blocklist and the DoH upstream in one step. They are removed too.
+
+`purge_raspap` defaults to **true** and does three things worth spelling out:
+
+- **`raspapd` is masked, not merely disabled.** It is a oneshot that runs at
+  every boot, and its job includes `Disabling systemd-networkd` — it would
+  silently undo the networkd migration on the next reboot.
+- **`lighttpd` is stopped and disabled.** It was listening on `0.0.0.0:80`.
+  netmode's input chain never accepted `:80` on any interface, so it was not
+  reachable off-box, but it is the process that writes the fragments above.
+- **`/etc/sudoers.d/090_raspap` is removed.** It granted `www-data` passwordless
+  root to `cat` `wpa_supplicant.conf` (every venue PSK), overwrite
+  `hostapd.conf` (the AP passphrase) and `dhcpcd.conf` (what netmode rewrites),
+  install `/etc/dnsmasq.d/090_*.conf`, and `reboot`. Because `/etc/raspap` is
+  `www-data`-owned, and rename permission comes from the parent directory,
+  `www-data` could also swap the root-owned `hostapd/` subdirectory and have
+  `sudo /etc/raspap/hostapd/servicestart.sh` execute its own script as root.
+
+The `/etc/raspap*` trees themselves are left on disk — inert once the sudoers
+rule and both services are gone.
 
 `ap_passphrase` is undefined on purpose, so `hostapd.conf` is left alone and
 your AP keeps its current config and clients. Vault it to manage the AP:

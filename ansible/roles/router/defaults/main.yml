@@ -37,6 +37,12 @@ admin_on_uplink: false
 # Set false for the first run on a box you cannot physically reach.
 converge_on_deploy: true
 
+# RaspAP removal. Its daemon runs at every boot and disables systemd-networkd,
+# and its sudoers drop-in gives www-data passwordless root over wpa_supplicant,
+# hostapd.conf, dhcpcd.conf and /etc/dnsmasq.d/090_*.conf - a standing re-entry
+# route around the blocklist and the DoH upstream. Nothing here depends on it.
+purge_raspap: true
+
 # Privacy on venue networks. Randomises wlan0's MAC per-ESS and eth0's MAC when
 # eth0 is the uplink. Turn off only if some network you rely on does MAC-based
 # auth or hands you a MAC reservation you need.
@@ -49,9 +55,9 @@ randomize_client_mac: true
 # eth0 CONSUMES the venue's.
 # ---------------------------------------------------------------------------
 netmode_profiles:
-  home:       {mode: serve,  vpn: false}   # 5G hotspot upstream, no tunnel
-  hotel-wifi: {mode: serve,  vpn: true}    # venue wifi upstream, tunnel + killswitch
-  hotel-eth:  {mode: uplink, vpn: true}    # venue ethernet upstream, tunnel + killswitch
+  home: { mode: serve, vpn: false } # 5G hotspot upstream, no tunnel
+  hotel-wifi: { mode: serve, vpn: true } # venue wifi upstream, tunnel + killswitch
+  hotel-eth: { mode: uplink, vpn: true } # venue ethernet upstream, tunnel + killswitch
 
 vpn_interface: wg0
 

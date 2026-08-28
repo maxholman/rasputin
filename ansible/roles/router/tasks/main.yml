@@ -1,31 +1,54 @@
 ---
-# No update_cache: this box's own DNS is fail-closed (099-upstream.conf points
-# at a Proton resolver inside a WireGuard tunnel that isn't up), so apt cannot
-# resolve deb.debian.org and a refresh fails hard. With state=present and the
-# packages already installed, no network is needed at all. Re-enable the cache
-# refresh only once the Pi can resolve names.
+# No update_cache: this box's DNS is fail-closed by design - blocky answers only
+# over a DoH upstream, and the kill switch drops that egress whenever the tunnel
+# is down - so a refresh cannot resolve deb.debian.org and fails hard. With
+# state=present and the packages already installed, no network is needed at all.
 - name: Install router packages
   ansible.builtin.apt:
     name: [dnsmasq, hostapd, dhcpcd5, nftables]
     state: present
 
-# --- RaspAP-ectomy (opt-in: -e purge_raspap=true) --------------------------
-# Only the web UI/daemon removal is opt-in; the config fragments above are not.
-- name: Stop and disable RaspAP services
+# --- RaspAP-ectomy ---------------------------------------------------------
+# raspapd is a oneshot that runs at EVERY boot, and its job includes disabling
+# systemd-networkd. Stopping it is not enough - it is masked so nothing can pull
+# it back in by dependency, and so it cannot undo the networkd migration.
+- name: Mask RaspAP daemon
   ansible.builtin.systemd:
-    name: "{{ item }}"
+    name: raspapd
     state: stopped
     enabled: false
-  loop: [raspapd, lighttpd]
+    masked: true
   failed_when: false
-  when: purge_raspap | default(false) | bool
+  when: purge_raspap | bool
 
-# NOT optional. These cannot coexist with ours - verified with dnsmasq --test:
-# 090_raspap.conf and 10-base.conf both set log-facility, which dnsmasq rejects
-# as "illegal repeated keyword", and 090_wlan1.conf duplicates our wlan1
-# dhcp-range. Leaving them in place means dnsmasq refuses to start at all.
-# 090_adblock.conf and 099-upstream.conf are left alone; they don't conflict.
-- name: Remove conflicting RaspAP dnsmasq fragments
+- name: Stop and disable the RaspAP web UI
+  ansible.builtin.systemd:
+    name: lighttpd
+    state: stopped
+    enabled: false
+  failed_when: false
+  when: purge_raspap | bool
+
+# The sudoers drop-in outlives the daemon and is the real prize: it grants
+# www-data passwordless root to read wpa_supplicant.conf (the venue PSKs), to
+# overwrite hostapd.conf (the AP passphrase) and dhcpcd.conf (what netmode
+# rewrites), and to drop new /etc/dnsmasq.d/090_*.conf fragments - re-entry
+# around both the blocklist and the DoH upstream. Removing a file cannot make
+# sudoers unparseable, so this needs no validate step.
+- name: Remove the RaspAP sudoers drop-in
+  ansible.builtin.file:
+    path: /etc/sudoers.d/090_raspap
+    state: absent
+  when: purge_raspap | bool
+
+# NOT optional. The 090_* ones cannot coexist with ours - verified with
+# dnsmasq --test: 090_raspap.conf and 10-base.conf both set log-facility, which
+# dnsmasq rejects as "illegal repeated keyword", and 090_wlan1.conf duplicates
+# our wlan1 dhcp-range. Leaving them in place means dnsmasq refuses to start.
+# The 099-upstream pair is inert only because 10-base.conf sets port=0; drop
+# port=0 with those in place and dnsmasq resolves in plaintext to 1.1.1.1,
+# silently bypassing blocky and the DoH upstream. They go too.
+- name: Remove RaspAP dnsmasq fragments
   ansible.builtin.file:
     path: "/etc/dnsmasq.d/{{ item }}"
     state: absent
@@ -34,6 +57,9 @@
     - 090_wlan0.conf   # should never have existed: wlan0 is always a client
     - 090_wlan1.conf
     - 090_eth0.conf
+    - 090_adblock.conf
+    - 099-upstream.conf
+    - 099-upstream.conf.orig
   notify: restart dnsmasq
 
 # --- config ----------------------------------------------------------------
