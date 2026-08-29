@@ -50,9 +50,12 @@ blocking:
     maxErrorsPerSource: 5
 
 caching:
-  minTime: 5m
-  maxTime: 30m
+  minTime: {{ blocky_cache_min }}
+  maxTime: {{ blocky_cache_max }}
+  cacheTimeNegative: {{ blocky_cache_negative }}
   prefetching: true
+  prefetchExpires: {{ blocky_prefetch_expires }}
+  prefetchThreshold: {{ blocky_prefetch_threshold }}
 
 log:
   level: {{ blocky_log_level }}

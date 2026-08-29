@@ -41,9 +41,18 @@
     name: wpa_supplicant
     state: restarted
 
-# blocky has no offline config test, so this restarts and then proves it
-# resolves - the same shape as the hostapd pair above, and for the same
-# reason: a resolver that failed to start must not report green.
+# blocky DOES have an offline config test, so it gets guard rail #1 rather than
+# the hostapd treatment: validate first, and never restart onto a config that
+# cannot load. Verified to exit 1 on both a bad duration and an unknown key.
+# Handlers on one topic run in definition order, so this must stay above the
+# restart.
+- name: validate blocky config
+  listen: restart blocky
+  ansible.builtin.command: /usr/local/bin/blocky validate --config /etc/blocky/config.d
+  changed_when: false
+
+# Restart, then prove it resolves - the same shape as the hostapd pair above,
+# and for the same reason: a resolver that failed to start must not report green.
 - name: restart blocky
   listen: restart blocky
   ansible.builtin.systemd:

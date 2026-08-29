@@ -809,7 +809,17 @@ converge() {
   # The listen addresses just changed with the mode and blocky binds them at
   # startup, so without this it keeps answering on the addresses the PREVIOUS
   # mode had - or, switching the other way, never binds the new one at all.
-  systemctl restart blocky
+  #
+  # Validate first, the same guard rail dnsmasq gets. netmode writes two of the
+  # three config.d fragments, and a resolver that fails to start is the one
+  # failure this box cannot absorb - so on bad config the OLD blocky is left
+  # running rather than restarted into nothing.
+  if /usr/local/bin/blocky validate --config /etc/blocky/config.d >/dev/null 2>&1; then
+    systemctl restart blocky
+  else
+    echo "netmode: WARNING - blocky config invalid; resolver NOT restarted, keeping the running one" >&2
+    /usr/local/bin/blocky validate --config /etc/blocky/config.d 2>&1 | tail -3 >&2
+  fi
   # dhcpcd may still be a second or two behind on the LAN address, and the unit
   # retries on failure, so wait for a real answer instead of trusting
   # is-active. A resolver that is "running" but not bound is the failure this

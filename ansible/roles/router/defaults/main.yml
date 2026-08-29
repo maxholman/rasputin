@@ -102,6 +102,30 @@ blocky_denylists:
   threat:
     - https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/tif.medium-onlydomains.txt
 
+# Cache. Every uncached answer costs a full round trip over whatever uplink we
+# are on - measured at ~130 ms on a 5G tether - and AP clients pay it directly,
+# because unlike the UniFi (which has its own cache) this box is their only
+# resolver and has nothing in front of it.
+#
+# maxTime was the expensive setting: at 30m it CAPPED authoritative TTLs,
+# discarding day-long records every half hour to no purpose. minTime is the
+# opposite lever - it floors short TTLs - and stays modest on purpose, because
+# short CDN TTLs are how you get steered off a dead edge.
+#
+# Long cache times are safe on a box that travels: every converge restarts
+# blocky, and changing venue means converging, so nothing survives the move.
+blocky_cache_min: 10m
+blocky_cache_max: 12h
+
+# A failed lookup must not stick. blocky's default of 30m means one query made
+# while the tunnel was down poisons that name for the next half hour.
+blocky_cache_negative: 1m
+
+# Two hits is enough to call a name popular on a network this small; the stock
+# threshold of 5 means most names expire before they ever qualify.
+blocky_prefetch_threshold: 2
+blocky_prefetch_expires: 12h
+
 blocky_block_ttl: 6h
 blocky_list_refresh: 24h
 blocky_log_level: info
