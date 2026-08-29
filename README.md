@@ -37,6 +37,8 @@ invite exactly the wrong command.
     netmode uplink     # eth0 consumes a WAN from the venue
     netmode status     # declared vs actual
     netmode converge   # re-apply declared mode (runs at boot)
+    netmode portal     # open a bounded hole to clear a captive portal
+    netmode mac-new    # drop the pinned uplink MAC, take a fresh identity
 
 `serve`/`uplink` write `/etc/netmode/mode`, then converge. Boot runs the same
 converge path, so there is no drift between "what I asked for" and "what boots".
@@ -130,6 +132,7 @@ validated with `nft -c` before it is ever loaded.
     input    policy drop  - established/related, loopback, some ICMP,
                             DHCP+DNS from LAN legs, SSH from admin legs
     forward  policy drop  - LAN -> egress, LAN <-> LAN, replies inbound
+                            (portal mode: :80/:443 only, guests still dropped)
     output   policy drop  - ONLY when the profile requires a tunnel: wg0, LAN,
                             loopback, the WireGuard handshake, DHCP renewal
     nat      masquerade on the current egress
@@ -207,13 +210,20 @@ matched first) — it's the *next* connection that would fail. Confirm from a
 - Quad9 is given by hostname because **its certificate has no IP SANs**.
   Bootstrapping it needs an IP-addressed DoH endpoint, which is what
   `blocky_bootstrap` (`https://1.1.1.1/dns-query`) is for. There is no
-  plaintext DNS path anywhere, including bootstrap.
+  plaintext DNS path anywhere, including bootstrap — with exactly one bounded,
+  timer-enforced exception, [captive portal mode](#captive-portals).
 - Clients are handed **this box and nothing else** by DHCP option 6. A public
   secondary would be a standing bypass around the blocklist, the DoH upstream
   and the kill switch.
 - The box resolves through blocky too — `/etc/resolv.conf` is pinned to
   `127.0.0.1`, and `DNS =` is stripped from `wg0.conf` so wg-quick cannot
   point it at Proton behind blocky's back.
+- The **upstream half lives in `15-upstream.yml`, which netmode owns**, not in
+  the Ansible-written base. It is the half that changes: portal mode replaces
+  the DoH endpoints with the venue's resolver, and writing the whole
+  `upstreams` block from one place means there is never a question about how
+  two `config.d` fragments merge. Ansible writes a DoH baseline so a
+  `converge_on_deploy=false` deploy still leaves blocky an upstream at all.
 - Listen addresses are **specific, never `0.0.0.0`**. The input chain already
   refuses `:53` from the uplink, but `netmode rollback-fire` deletes that whole
   table — a wildcard bind would turn the lockout insurance into an open
@@ -312,6 +322,148 @@ Two halves, and the second one is new:
   read the chain **fails open with a loud warning** rather than stranding the
   box — `netmode status` reports whether it is armed.
 
+## Captive portals
+
+**Solved, in a bounded window.** The reason a login page was unreachable from
+this box is worth stating precisely, because it was never the firewall:
+
+- blocky's only upstream is **DoH on `:443`**, and intercepting `:443` is
+  exactly what a portal does. No name resolves, so the portal's own login page
+  cannot load — before a single rule of ours is consulted. No ordering trick
+  escapes this: DoH *is* the thing being blocked.
+- on a `vpn: true` profile, `wg-quick up` **succeeds against a network that
+  drops every packet it sends**. Converge then armed the kill switch around a
+  tunnel that had never handshook, and the box lost the one network it needed
+  in order to log in.
+
+`netmode portal` opens a hole big enough to log in and no bigger, and closes it
+on a timer whether or not you remember to:
+
+    netmode portal            # open it - 15 minutes by default
+    netmode portal --check    # probe only, change nothing
+    netmode portal --for 600  # a shorter window
+    netmode hotel-wifi        # done - back to the tunnel, keeping the MAC
+
+While the window is open:
+
+| | |
+|---|---|
+| tunnel | **down** — `wg0` cannot handshake through a portal anyway |
+| clients | `tcp 80/443` out the uplink only. The venue-subnet drop stands, so other guests stay unreachable; so do the mDNS/SSDP/SMB discovery drops |
+| DNS | **plaintext to the venue's resolver**, read from our own DHCP lease |
+| blocklist | still on — malware and phishing stay blocked throughout |
+| this box | output chain `accept`, because its resolver has to reach the venue's |
+
+The hole is in *which protocols may leave*, never in *who may be reached*.
+
+### The plaintext exception
+
+This is the one place the "every query leaves over DoH" rule is broken, and it
+is broken deliberately, because the alternative is a router that cannot be used
+at a hotel. Three things bound it:
+
+- it is written to `/etc/blocky/config.d/15-upstream.yml`, a file **netmode
+  rewrites on every converge** — so a converge from any cause restores DoH;
+- a transient systemd timer forces exactly such a converge when the window
+  expires. The marker carries its own expiry, so a reboot mid-portal **re-arms
+  the timer from the recorded expiry** rather than losing the bound or
+  extending it;
+- `netmode status` and the status viewer both report the upstream **in red**
+  for as long as it is plaintext.
+
+Naming a profile (`netmode hotel-wifi`) leaves portal mode. Bare `netmode
+converge` does not — that is what boot runs, and a reboot must not silently
+drop a window you are still inside.
+
+### Detection
+
+The probe has to work with no DNS at all, so it speaks HTTP/1.1 to a literal
+anycast address and supplies its own `Host` header. `204` with no body is the
+agreed "you are online" answer and a portal **cannot** give it: to show you a
+login page it has to answer `200` or redirect. The redirect's `Location` *is*
+the portal's login URL, and reporting it is the only way to learn that address
+without a resolver.
+
+Three outcomes, deliberately kept distinct:
+
+| | |
+|---|---|
+| `204` | clear |
+| `200`/`3xx` | portal — reported with its login URL |
+| no TCP at all | **a dead uplink, not a portal**, and must not be treated as one |
+
+Targets are `portal_probe_targets` (two Cloudflare anycast addresses for the
+same service). Pin your own if a venue blackholes them.
+
+### The MAC problem
+
+A portal authorises **a MAC address**, not a person. Converge randomises the
+uplink MAC every time — so the converge that *followed* a successful login used
+to throw that login away, which is what made the old cloned-MAC workaround
+necessary.
+
+`netmode portal` pins whatever MAC cleared the portal, and every converge after
+it holds that MAC. Arriving somewhere new still gets a fresh identity: `netmode
+portal` drops the old pin *before* choosing the MAC the venue will authorise.
+Release it deliberately when you leave:
+
+    netmode mac-new           # drop the pin, fresh identity, converge
+
+`netmode status` shows `PINNED`, or `PIN ... NOT APPLIED` if a pin exists but
+the interface is not wearing it.
+
+Holding a MAC on `wlan0` took three corrections, all found on hardware and all
+invisible in a dry run:
+
+- **`wpa_supplicant`, not `ip link`, decides the address.** `mac_addr=1` in
+  `wpa_supplicant.conf` randomises per ESS at association and overwrites
+  whatever was set directly. Measured: netmode set `02:c7:fc:e9:3d:56` and the
+  interface came up wearing `8a:db:56:49:f7:6f`. The old comment claiming
+  brcmfmac ignores `mac_addr=1` was simply wrong. netmode now flips it to
+  `mac_addr=0` while a pin is held, and back to `1` when the pin is dropped.
+- **The supplicant must be stopped across the change.** Setting the MAC
+  underneath a live instance lets it react to the interface bounce and
+  re-randomise over the top. Stopped for the change and started after, the
+  address holds. (`preassoc_mac_addr=1` still randomises during the *scan*, so
+  the MAC reads wrong for a second or two before association — sampling it
+  before `wpa_state=COMPLETED` reports an address about to be discarded.)
+- **The instance unit owns the interface.** `wpa_supplicant@wlan0` is
+  `-c …-wlan0.conf -i wlan0`; the plain `wpa_supplicant.service` on this image
+  is the D-Bus daemon (`-u -s -O`) and restarting it does not touch `wlan0` at
+  all. `reassociate_wifi` had been restarting the wrong one for its whole life
+  — the interface bounce was doing the work by accident.
+
+Ansible and netmode both write `mac_addr`, so the role's `lineinfile` carries a
+`regexp`. Without it, a deploy while a pin is held **appends** a second
+`mac_addr=` line rather than replacing the first, and the file becomes
+ambiguous about which wins. netmode collapses duplicates on every converge.
+
+### Converge no longer walks into the trap
+
+On a `vpn: true` profile, converge probes for a portal **before it builds the
+tunnel**, and the ordering is load-bearing in two ways that cost real debugging
+to find:
+
+- the probe runs **after** the MAC change, the reassociation and the dhcpcd
+  bounce. Before that, the uplink is still on the *previous* venue's
+  association and every probe comes back dead.
+- the probe runs **with `wg0` down** — `wg-quick` installs a default route into
+  the tunnel, so once it is up this box cannot see the venue's portal at all,
+  which is exactly the state being diagnosed. `vpn_stop` is therefore
+  unconditional; the tunnel is rebuilt a few lines later.
+
+What each outcome does:
+
+- **portal detected** — it stops, naming the login URL and the two commands to
+  run. The kill switch is never armed around a tunnel that cannot reach its
+  peer, and the previous ruleset is left intact.
+- **no HTTP path** — a warning, then it converges fail-closed anyway. A dead
+  uplink should stay dead rather than open the box.
+- **clear** — the tunnel comes up, and a missing **handshake** is then reported
+  as a peer or key problem rather than a portal, because a portal has already
+  been ruled out. (`wg-quick up` succeeds against a network that drops
+  everything, so the interface existing proves nothing on its own.)
+
 ## Status viewer
 
 `tools/status/` is a laptop-side TUI (Rust, ratatui). Nothing is installed on
@@ -331,13 +483,29 @@ nonce label blocky cannot have cached, forcing a live round trip through the
 DoH upstream: NXDOMAIN is healthy, SERVFAIL means blocky is up but its
 upstream (or the uplink) is dead.
 
+The **INTERFACES** panel is the at-a-glance half: one full-width row per
+physical port, the whole row painted by state — green for up and addressed,
+amber for associated but no lease yet, red for no carrier, grey for a leg with
+no job in this profile (`wlan0` under `hotel-eth`). Roles follow the profile,
+so the row labelled `uplink` moves between `wlan0` and `eth0` on its own, and
+an idle leg reads as idle rather than as a fault.
+
+Traffic accounting is deliberately cheap. Per-second rates are diffed from
+`/proc/net/dev` between ticks and held in the viewer's memory; the totals are
+the kernel's own since-boot counters. Nothing is installed on the Pi, nothing
+is written anywhere, and **no counters are added to the ruleset the kill switch
+lives in**. `--once` has no previous sample to diff against, so it prints
+totals and a `—` for the rates.
+
 It judges state against the declared profile (`vpn:` in `netmode_profiles`).
 A green ✓ marks only a promised protection verified present (wg0 up, guard
 drop, on a `vpn: true` profile); a red ✗ marks a mismatch either way; an
 expected-down state renders neutral ("down · no VPN in this profile").
 Unknown profiles get facts with no judgement. The WAN section's gateway ping
 is skipped while the output chain is `policy drop`, so the viewer never
-probes around the kill switch. Needs sudo on the Pi; it prompts, or takes
+probes around the kill switch. An open portal window and a plaintext upstream
+are both rendered red for as long as they last — they are deliberate holes, so
+they are stated loudly rather than quietly. Needs sudo on the Pi; it prompts, or takes
 `--sudo-pass-file` for scripting.
 
 ## Two guard rails, both earned
@@ -352,12 +520,6 @@ probes around the kill switch. Needs sudo on the Pi; it prompts, or takes
 
 ## Known separate issues
 
-- Captive portals at hotels/conferences still need a browser on the WAN side or
-  a cloned MAC. Not solved here. On `hotel-*` profiles this is a chicken-and-egg:
-  converge refuses to complete until wg0 is up, and wg0 cannot handshake until
-  the portal is cleared. Clear it from a device joined directly to the venue
-  wifi, then clone that MAC onto wlan0. The status viewer flags the signature
-  (path up on :443, no reply from the external-ip probe).
 - dhcpcd → systemd-networkd migration: deliberately deferred to the next
   rebuild (OS upgrade or fresh SD card), on the bench with keyboard access.
   The sed surgery on dhcpcd.conf is a real wart, but it is debugged and the
