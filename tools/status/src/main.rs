@@ -28,11 +28,6 @@ const DNS_OK_DOMAIN: &str = "example.com";
 // A domain on the HaGeZi TIF list blocky imports; blocky answers 0.0.0.0.
 // If the list ever drops it, the probe reports "not blocked" - swap the domain.
 const DNS_BLOCKED_DOMAIN: &str = "8562.cn.com";
-// Base for the cache-busting upstream probe. blocky serves a repeated name
-// from cache forever, so only a never-seen label forces a round trip through
-// the DoH upstream - NXDOMAIN is the healthy answer, SERVFAIL means blocky is
-// up but its upstream (or the uplink) is dead.
-const DNS_UPSTREAM_BASE: &str = "example.com";
 
 // Batched collection script, run under sudo on the Pi. One round trip per tick.
 const REMOTE_SCRIPT: &str = r#"
@@ -53,6 +48,7 @@ else echo "extip nocurl"; fi
 s wg;       wg show wg0 2>/dev/null
 s addrs;    ip -br addr show 2>/dev/null
 s netdev;   cat /proc/net/dev
+s doh;      ss -lntp 'sport = :443' 2>/dev/null | grep -c blocky
 s wlan0;    iw dev wlan0 link 2>/dev/null
 s ethlink;  echo "speed $(cat /sys/class/net/eth0/speed 2>/dev/null || echo -)"
             echo "carrier $(cat /sys/class/net/eth0/carrier 2>/dev/null || echo 0)"
@@ -246,7 +242,6 @@ struct Status {
     leases_lan: usize,
     dns_ok: DnsProbe,
     dns_blocked: DnsProbe,
-    dns_upstream: DnsProbe,
     doh_listening: Option<bool>,
     error: Option<String>,
     taken_at: Option<Instant>,
@@ -311,6 +306,10 @@ fn collect(opts: &Opts, host: &str, sudo_pw: Option<&str>) -> Status {
                     }
                 }
             }
+            // Asked of the box, not probed from here. Opening and dropping a TCP
+            // connection to :443 every tick logged a TLS handshake error on the
+            // Pi every tick, and cost a round trip to learn what `ss` already knows.
+            st.doh_listening = sections.get("doh").map(|d| d.trim() != "0");
             st.wlan0_link = sections.get("wlan0").cloned().unwrap_or_default();
             if let Some(el) = sections.get("ethlink") {
                 for line in el.lines() {
@@ -375,18 +374,6 @@ fn collect(opts: &Opts, host: &str, sudo_pw: Option<&str>) -> Status {
 
     st.dns_ok = dns_probe(host, DNS_OK_DOMAIN);
     st.dns_blocked = dns_probe(host, DNS_BLOCKED_DOMAIN);
-    // Nanosecond label: unique per tick, or blocky's negative cache (a day for
-    // example.com) would answer every probe after the first without going out.
-    let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-    st.dns_upstream = dns_probe(host, &format!("st{nonce}.{DNS_UPSTREAM_BASE}"));
-    st.doh_listening = Some(
-        format!("{host}:443")
-            .to_socket_addrs()
-            .ok()
-            .and_then(|mut a| a.next())
-            .and_then(|a| TcpStream::connect_timeout(&a, Duration::from_millis(1200)).ok())
-            .is_some(),
-    );
     st.taken_at = Some(Instant::now());
     st
 }
@@ -479,17 +466,6 @@ fn vpn_expected(profile: &str) -> Option<bool> {
     }
 }
 
-/// Interface roles and VPN policy declared by the profile.
-fn profile_desc(profile: &str) -> Option<&'static str> {
-    match profile {
-        "home" | "serve" | "lan" => Some("WAN wlan0 · LAN eth0 · no VPN"),
-        "hotel-wifi" => Some("WAN wlan0 · LAN eth0 · VPN + kill switch"),
-        "hotel-eth" => Some("WAN eth0 · VPN + kill switch"),
-        "uplink" | "wan" => Some("WAN eth0 · no VPN"),
-        _ => None,
-    }
-}
-
 /// The physical uplink leg each profile declares. wg0 rides on this, so it is
 /// derived from the profile, not from `ip route get` (which names wg0 when the
 /// tunnel is up).
@@ -515,12 +491,6 @@ fn fmt_egress(raw: &str) -> String {
     }
 }
 
-/// Keep the route's substance, drop the dhcp bookkeeping after " proto ".
-fn fmt_route(raw: &str) -> String {
-    let r = raw.trim_end_matches([';', ' ']);
-    r.split(" proto ").next().unwrap_or(r).to_string()
-}
-
 /// `40 (5200 MHz), width: 80 MHz, center1: 5210 MHz` → `ch 40 · 80 MHz`
 fn fmt_channel(raw: &str) -> String {
     let ch = raw.split_whitespace().next().unwrap_or("?");
@@ -531,7 +501,7 @@ fn fmt_channel(raw: &str) -> String {
 }
 
 /// One physical port, as a switch's front panel would show it.
-#[derive(PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 enum PortState {
     Up,      // carrier and an address - the only green state
     NoAddr,  // link up, DHCP has not landed yet
@@ -550,7 +520,7 @@ struct Port {
     addr: String,
     detail: String,
     rate: Option<(u64, u64)>,
-    total: (u64, u64),
+    total: Option<(u64, u64)>,
 }
 
 /// 13002342 → "12.4M". At most five columns wide, so the rate fields align.
@@ -582,6 +552,13 @@ fn wifi_detail(link: &str) -> String {
         (true, false) => signal,
         (true, true) => "not associated".into(),
     }
+}
+
+/// "latest handshake: 1 minute, 2 seconds ago" → "1 minute, 2 seconds ago"
+fn wg_handshake(st: &Status) -> Option<String> {
+    st.wg
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("latest handshake:").map(|v| v.trim().to_string()))
 }
 
 fn ports(st: &Status) -> Vec<Port> {
@@ -634,15 +611,91 @@ fn ports(st: &Status) -> Vec<Port> {
             addr,
             detail,
             rate: st.rates.get(iface).copied(),
-            total: st.netdev.get(iface).copied().unwrap_or((0, 0)),
+            total: st.netdev.get(iface).copied(),
         });
     }
+
+    // wg0 is a port too. It is not a physical one, but it is where you look to
+    // ask "is my traffic protected", and that belongs beside the legs it rides
+    // on rather than in a section of its own.
+    let up = st.ifaces.contains_key("wg0");
+    let (state, detail) = match (vpn_expected(&profile), up) {
+        // Configured but deliberately unused here - NOT "not configured", which
+        // would send you hunting for a wg0.conf that is present and correct.
+        (Some(false), false) => (PortState::Unused, format!("not used by '{profile}'")),
+        (Some(false), true) => (PortState::NoAddr, format!("UP but '{profile}' declares no VPN")),
+        (Some(true), true) => (
+            PortState::Up,
+            wg_handshake(st).map(|h| format!("handshake {h}")).unwrap_or_else(|| "no handshake yet".into()),
+        ),
+        (Some(true), false) => (PortState::Down, format!("required by '{profile}'")),
+        (None, true) => (PortState::Unknown, "up".into()),
+        (None, false) => (PortState::Unknown, "down".into()),
+    };
+    out.push(Port {
+        role: "vpn",
+        iface: "wg0",
+        state,
+        addr: st
+            .ifaces
+            .get("wg0")
+            .and_then(|r| r.split_whitespace().find(|a| a.contains('.')))
+            .unwrap_or("—")
+            .to_string(),
+        detail,
+        rate: st.rates.get("wg0").copied(),
+        total: st.netdev.get("wg0").copied(),
+    });
     out
 }
 
+/// Everything that is not as the profile promised, in the order you would want
+/// to hear it. `None` = the profile is not one we know, so nothing is judged;
+/// `Some([])` = the box is doing what it said it would.
+fn faults(st: &Status) -> Option<Vec<String>> {
+    let profile = st.netmode.get("profile").cloned().unwrap_or_default();
+    let want_vpn = vpn_expected(&profile)?;
+    let mut f = Vec::new();
+
+    // The uplink carries everything else, so it is named first when it is out.
+    if let Some(up) = uplink_if(&profile) {
+        match st.ifaces.get(up) {
+            None => f.push(format!("{up} missing")),
+            Some(r) if r.split_whitespace().next() != Some("UP") => f.push(format!("{up} DOWN")),
+            Some(r) if !r.split_whitespace().any(|a| a.contains('.')) => {
+                f.push(format!("{up} has no address"))
+            }
+            _ => {}
+        }
+    }
+    if want_vpn {
+        if !st.ifaces.contains_key("wg0") {
+            f.push("wg0 DOWN - clients have no egress".into());
+        }
+        if !st.netmode.get("output guard").map(|g| g.contains("drop")).unwrap_or(false) {
+            f.push("kill switch NOT ARMED".into());
+        }
+    }
+    for (name, key) in
+        [("dnsmasq", "dnsmasq (dhcp)"), ("blocky", "blocky (dns)"), ("hostapd", "hostapd")]
+    {
+        if st.netmode.get(key).map(|v| v != "active").unwrap_or(false) {
+            f.push(format!("{name} not running"));
+        }
+    }
+    if st.dns_ok.error.is_some() {
+        f.push("DNS not resolving".into());
+    }
+    // An open portal window is a deliberate hole, not a fault - but it is
+    // temporary and you want to be reminded you are standing in it.
+    if st.netmode.get("portal").map(|p| p.starts_with("OPEN")).unwrap_or(false) {
+        f.push("captive portal window OPEN".into());
+    }
+    Some(f)
+}
+
 struct Judged {
-    vpn: (String, bool), // text, is_mismatch
-    guard: (String, bool),
+    guard: (String, bool), // text, is_mismatch
     protected: bool, // tunnel profile fully enforced - the one green state
 }
 
@@ -651,7 +704,6 @@ fn judge(st: &Status) -> Judged {
     let vpn_up = st.netmode.get("vpn (wg0)").map(|v| v == "UP").unwrap_or(false);
     let guard_raw = st.netmode.get("output guard").cloned().unwrap_or_else(|| "?".into());
     let guard_drop = guard_raw.contains("drop");
-    let vpn_word = if vpn_up { "UP" } else { "down" };
     let guard_word: String = if guard_drop {
         "drop".into()
     } else if guard_raw.contains("accept") {
@@ -665,34 +717,20 @@ fn judge(st: &Status) -> Judged {
             let vpn_ok = vpn_up == want;
             let guard_ok = guard_drop == want;
             Judged {
-                vpn: (
-                    if !vpn_ok {
-                        format!("{vpn_word} ✗ expected {}", if want { "UP" } else { "down" })
-                    } else if want {
-                        format!("{vpn_word} ✓")
-                    } else {
-                        format!("{vpn_word} · no VPN in this profile")
-                    },
-                    !vpn_ok,
-                ),
                 guard: (
                     if !guard_ok {
                         format!("{guard_word} ✗ expected {}", if want { "drop" } else { "accept" })
                     } else if want {
-                        format!("{guard_word} ✓")
+                        "armed ✓".to_string()
                     } else {
-                        format!("{guard_word} · no VPN in this profile")
+                        format!("{guard_word} · not required here")
                     },
                     !guard_ok,
                 ),
                 protected: want && vpn_ok && guard_ok,
             }
         }
-        None => Judged {
-            vpn: (vpn_word.into(), false),
-            guard: (guard_word, false),
-            protected: false,
-        },
+        None => Judged { guard: (guard_word, false), protected: false },
     }
 }
 
@@ -773,9 +811,15 @@ fn build_lines(
                 .add_modifier(Modifier::BOLD | Modifier::REVERSED),
         ),
     ];
-    if let Some(desc) = profile_desc(&profile) {
-        headline.push(Span::styled(format!("  {desc}"), *dim));
-    }
+    // What the topology is belongs in the port panel, which states it directly.
+    // The headline's job is the one thing the panel cannot say: whether the box
+    // is doing what the profile promised.
+    let (verdict, verdict_style) = match faults(st) {
+        None => ("unrecognised profile · facts only, nothing judged".to_string(), *dim),
+        Some(f) if f.is_empty() => ("as declared".to_string(), *good),
+        Some(f) => (f.join(" · "), *bad),
+    };
+    headline.push(Span::styled(format!("  {verdict}"), verdict_style));
     lines.push(Line::from(headline));
     lines.push(Line::default());
 
@@ -788,7 +832,7 @@ fn build_lines(
     // Header and rows share one format string so their columns cannot drift
     // apart; the three leading spaces match the row's margin plus its lamp.
     let cells = |a: &str, b: &str, c: &str, d: &str, e: &str, f: &str, g: &str, h: &str, i: &str| {
-        format!(" {a:<8} {b:<6} {c:<6} {d:<18} {e:<20} {f:>7} {g:>7}   {h:>6} / {i:<6}")
+        format!(" {a:<8} {b:<6} {c:<6} {d:<18} {e:<24} {f:>7} {g:>7}   {h:>6} / {i:<6}")
     };
     lines.push(Line::from(Span::styled(
         format!("   {}", cells("role", "iface", "state", "address", "link", "↓/s", "↑/s", "total↓", "↑")),
@@ -796,6 +840,10 @@ fn build_lines(
     )));
     for p in ports(st) {
         let (rx, tx) = match p.rate {
+            Some((rx, tx)) => (fmt_bytes(rx), fmt_bytes(tx)),
+            None => ("—".into(), "—".into()),
+        };
+        let (trx, ttx) = match p.total {
             Some((rx, tx)) => (fmt_bytes(rx), fmt_bytes(tx)),
             None => ("—".into(), "—".into()),
         };
@@ -828,11 +876,11 @@ fn build_lines(
                         PortState::Unknown => "?",
                     },
                     &trunc(&p.addr, 18),
-                    &trunc(&p.detail, 20),
+                    &trunc(&p.detail, 24),
                     &rx,
                     &tx,
-                    &fmt_bytes(p.total.0),
-                    &fmt_bytes(p.total.1),
+                    &trx,
+                    &ttx,
                 ),
                 *plain,
             ),
@@ -883,37 +931,42 @@ fn build_lines(
         ip => (ip.to_string(), false),
     };
     lines.push(kv("external ip", extip.0, pick(extip.1)));
-    // Red for as long as the window is open: the tunnel is down and clients are
-    // loose on :80/:443, which is a state you want to leave, not settle into.
+    // "portal: closed" is an internal state name, and a row that says nothing
+    // on every ordinary tick trains you to stop reading the section. Shown only
+    // when a window is actually open, which is the state worth acting on.
     if let Some(portal) = st.netmode.get("portal") {
-        let open = portal.starts_with("OPEN");
-        lines.push(kv("portal", portal.clone(), pick(open)));
+        if !portal.starts_with("closed") {
+            lines.push(kv("portal", portal.clone(), bad));
+        }
     }
+    // Likewise the MAC: random is the normal, uninteresting case. A pin is not -
+    // it means a venue authorised this address and converge is holding it.
     if let Some(mac) = st.netmode.get("uplink mac") {
-        lines.push(kv("uplink mac", mac.clone(), if mac.contains("NOT APPLIED") { bad } else { dim }));
+        if !mac.ends_with("random") {
+            lines.push(kv("uplink mac", mac.clone(), if mac.contains("NOT APPLIED") { bad } else { dim }));
+        }
     }
     lines.push(Line::default());
 
-    lines.push(section("VPN"));
-    lines.push(kv("wg0", j.vpn.0.clone(), pick(j.vpn.1)));
-    if let Some(wg) = wg_summary(st) {
-        lines.push(kv("", wg, dim));
+    // The VPN gets a section only where it has something to say. wg0's own
+    // state is a port row now, so on a no-VPN profile there is nothing left
+    // here worth four lines of screen.
+    if vpn_expected(&profile) != Some(false) {
+        lines.push(section("VPN"));
+        lines.push(kv("kill switch", j.guard.0.clone(), pick(j.guard.1)));
+        if j.protected {
+            lines.push(kv("", "all egress via wg0".into(), good));
+        }
+        if let Some(wg) = wg_summary(st) {
+            lines.push(kv("transfer", wg, dim));
+        }
+        lines.push(kv(
+            "egress",
+            st.netmode.get("egress").map(|e| fmt_egress(e)).unwrap_or_else(|| "?".into()),
+            plain,
+        ));
+        lines.push(Line::default());
     }
-    lines.push(kv("kill switch", j.guard.0.clone(), pick(j.guard.1)));
-    if j.protected {
-        lines.push(kv("", "all egress via wg0".into(), good));
-    }
-    lines.push(kv(
-        "egress",
-        st.netmode.get("egress").map(|e| fmt_egress(e)).unwrap_or_else(|| "?".into()),
-        plain,
-    ));
-    lines.push(kv(
-        "route",
-        st.netmode.get("default route").map(|r| fmt_route(r)).unwrap_or_else(|| "?".into()),
-        plain,
-    ));
-    lines.push(Line::default());
 
     lines.push(section("LAN"));
     let mut ap = if st.ap_ssid.is_empty() { "?".to_string() } else { st.ap_ssid.clone() };
@@ -947,21 +1000,10 @@ fn build_lines(
 
     let resolve = match (&st.dns_ok.error, st.dns_ok.addrs.first()) {
         (Some(e), _) => (format!("{DNS_OK_DOMAIN} → FAILED: {e}"), true),
-        (None, Some(a)) => (format!("{DNS_OK_DOMAIN} → {a} · {} ms", st.dns_ok.millis), false),
+        (None, Some(a)) => (format!("{DNS_OK_DOMAIN} → {a} · {} ms ✓", st.dns_ok.millis), false),
         (None, None) => (format!("{DNS_OK_DOMAIN} → no A records"), true),
     };
     lines.push(kv("resolve", resolve.0, pick(resolve.1)));
-
-    // The cached probe above can pass for days with the uplink dead; this one
-    // cannot answer without a live round trip through the DoH upstream.
-    let up = &st.dns_upstream;
-    let upstream = match (&up.error, up.rcode) {
-        (Some(e), _) => (format!("uncached probe → NO RESPONSE ({e})"), true),
-        (None, 0) | (None, 3) => (format!("uncached probe → round trip · {} ms ✓", up.millis), false),
-        (None, 2) => ("uncached probe → SERVFAIL: blocky can't reach its DoH upstream".to_string(), true),
-        (None, rc) => (format!("uncached probe → rcode {rc}"), true),
-    };
-    lines.push(kv("upstream", upstream.0, pick(upstream.1)));
 
     let blk = &st.dns_blocked;
     let blocklist = match (&blk.error, blk.addrs.iter().any(|a| a == "0.0.0.0")) {
@@ -972,10 +1014,21 @@ fn build_lines(
     lines.push(kv("blocklist", blocklist.0, pick(blocklist.1)));
 
     // A plaintext upstream means portal mode and nothing else, so it is red
-    // rather than merely stated.
+    // rather than merely stated. Full URLs are noise here - the host is the
+    // part you read - but plaintext is shown verbatim and in full.
     if let Some(ups) = st.netmode.get("dns upstream") {
         let plain_dns = ups.starts_with("PLAINTEXT");
-        lines.push(kv("upstreams", ups.clone(), pick(plain_dns)));
+        let text = if plain_dns {
+            ups.clone()
+        } else {
+            let hosts: Vec<&str> = ups
+                .split_whitespace()
+                .skip(1)
+                .filter_map(|u| u.split("//").nth(1).and_then(|h| h.split('/').next()))
+                .collect();
+            format!("DoH · {}", hosts.join(", "))
+        };
+        lines.push(kv("upstream", text, pick(plain_dns)));
     }
 
     let doh = match st.doh_listening {
@@ -1186,6 +1239,7 @@ mod tests {
         s.netdev.insert("wlan0".into(), (4_509_715_660, 849_346_662));
         s.netdev.insert("wlan1".into(), (1_234_567, 89_000));
         s.netdev.insert("eth0".into(), (860_160, 94_208));
+        s.netdev.insert("wg0".into(), (0, 0));
         s.rates.insert("wlan0".into(), (13_002_342, 3_250_585));
         s.rates.insert("wlan1".into(), (1_258_291, 245_760));
         s.rates.insert("eth0".into(), (860_160, 94_208));
@@ -1212,11 +1266,62 @@ mod tests {
     #[test]
     fn roles_follow_the_profile() {
         let p = ports(&st("hotel-wifi"));
-        assert_eq!(p.iter().map(|p| p.role).collect::<Vec<_>>(), ["uplink", "ap", "lan"]);
+        assert_eq!(p.iter().map(|p| p.role).collect::<Vec<_>>(), ["uplink", "ap", "lan", "vpn"]);
         // eth0 takes the WAN in hotel-eth, which leaves wlan0 with no job.
         let p = ports(&st("hotel-eth"));
-        assert_eq!(p.iter().map(|p| p.role).collect::<Vec<_>>(), ["—", "ap", "uplink"]);
+        assert_eq!(p.iter().map(|p| p.role).collect::<Vec<_>>(), ["—", "ap", "uplink", "vpn"]);
         assert!(p[0].state == PortState::Unused, "an idle leg must not read as a fault");
+    }
+
+    /// wg0.conf exists and is correct on this box; `home` simply does not use
+    /// it. Reporting that as "not configured" would send you hunting for a file
+    /// that is already there - the distinction this test exists to hold.
+    #[test]
+    fn unused_vpn_is_not_the_same_as_a_broken_one() {
+        let wg = |s: &Status| ports(s).pop().unwrap();
+
+        let p = wg(&st("home"));
+        assert_eq!(p.state, PortState::Unused, "grey, not red");
+        assert_eq!(p.detail, "not used by \'home\'");
+
+        // The same interface missing on a profile that promises it IS a fault.
+        let p = wg(&st("hotel-wifi"));
+        assert_eq!(p.state, PortState::Down);
+        assert_eq!(p.detail, "required by \'hotel-wifi\'", "say who is asking for it");
+
+        // And up where promised, it reports the handshake - the only proof the
+        // tunnel actually reaches its peer.
+        let mut s = st("hotel-wifi");
+        s.ifaces.insert("wg0".into(), "UNKNOWN 10.2.0.2/32".into());
+        s.wg = "  latest handshake: 12 seconds ago\n  transfer: 1.2 GiB received".into();
+        let p = wg(&s);
+        assert_eq!(p.state, PortState::Up);
+        assert_eq!(p.detail, "handshake 12 seconds ago");
+    }
+
+    /// The headline says whether the box is doing what it promised, so silence
+    /// there has to mean something.
+    #[test]
+    fn faults_are_named_not_implied() {
+        let mut s = st("home");
+        s.netmode.insert("dnsmasq (dhcp)".into(), "active".into());
+        s.netmode.insert("blocky (dns)".into(), "active".into());
+        s.netmode.insert("hostapd".into(), "active".into());
+        s.dns_ok.addrs = vec!["1.2.3.4".into()];
+        assert_eq!(faults(&s), Some(vec![]), "a healthy home profile is silent");
+
+        // hotel-wifi promises a tunnel and a kill switch; this box has neither.
+        let mut h = s.clone();
+        h.netmode.insert("profile".into(), "hotel-wifi".into());
+        h.netmode.insert("output guard".into(), "policy accept".into());
+        let f = faults(&h).unwrap();
+        assert!(f.iter().any(|x| x.contains("wg0 DOWN")), "{f:?}");
+        assert!(f.iter().any(|x| x.contains("kill switch NOT ARMED")), "{f:?}");
+
+        // An unknown profile promises nothing, so nothing is judged.
+        let mut u = s.clone();
+        u.netmode.insert("profile".into(), "something-new".into());
+        assert_eq!(faults(&u), None);
     }
 
     #[test]
@@ -1244,7 +1349,7 @@ mod tests {
             .iter()
             .position(|l| l.iter().map(|s| s.content.as_ref()).collect::<String>().trim() == "INTERFACES")
             .expect("panel is rendered");
-        lines[start + 2..start + 5].to_vec() // skip the section title and the column header
+        lines[start + 2..start + 6].to_vec() // skip the section title and the column header
     }
 
     /// The lamp is the only span that is exactly two blank cells.
@@ -1261,14 +1366,15 @@ mod tests {
     fn lamp_colour_states_the_verdict() {
         assert_eq!(
             lamps("hotel-wifi", true),
-            vec![Some(Color::Green), Some(Color::Green), Some(Color::Green)]
+            // wg0 is red: hotel-wifi promises a tunnel and this fixture has none.
+            vec![Some(Color::Green), Some(Color::Green), Some(Color::Green), Some(Color::Red)]
         );
         // wlan0 has no job under hotel-eth: grey, not the red of a fault.
         assert_eq!(lamps("hotel-eth", true)[0], Some(Color::DarkGray));
         // An unknown profile means the eth0/wlan0 roles are unknown, so neither
-        // is judged. wlan1 still is: it is the AP by hardware invariant,
-        // whatever the profile is called.
-        assert_eq!(lamps("something-new", true), vec![None, Some(Color::Green), None]);
+        // is judged, and nor is wg0. wlan1 still is: it is the AP by hardware
+        // invariant, whatever the profile is called.
+        assert_eq!(lamps("something-new", true), vec![None, Some(Color::Green), None, None]);
         // --once is piped, so nothing is coloured.
         assert!(lamps("hotel-wifi", false).iter().all(|c| c.is_none()));
     }
@@ -1304,10 +1410,12 @@ mod tests {
         assert_eq!(bg(&s), Some(Color::Red), "no carrier is red");
     }
 
+    /// Not an assertion - a visual check. `cargo test show_the_panel -- --nocapture`
+    /// renders the whole view for a profile whose promises are NOT being met.
     #[test]
     fn show_the_panel() {
         for line in build_lines(&st("hotel-wifi"), &Style::default(), &Style::default(),
-                                &Style::default(), &Style::default(), false).iter().take(9) {
+                                &Style::default(), &Style::default(), false).iter() {
             let t: String = line.iter().map(|s| s.content.as_ref()).collect();
             println!("{}", t.trim_end());
         }

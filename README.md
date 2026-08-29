@@ -476,20 +476,39 @@ not full-screen repaints.
     rasputin-status --once         # plain-text snapshot, for scripts
 
 The DNS probes run from the laptop against the Pi's LAN address on purpose:
-they exercise the input chain, the listener and the DoH upstream as a real
-client would. `blocky healthcheck` on the box only proves the loopback
-listener - it passes with the tunnel dead. The `upstream` row queries a
-nonce label blocky cannot have cached, forcing a live round trip through the
-DoH upstream: NXDOMAIN is healthy, SERVFAIL means blocky is up but its
-upstream (or the uplink) is dead.
+they exercise the input chain and the listener as a real client would.
+`blocky healthcheck` on the box only proves the loopback listener — it passes
+with the tunnel dead.
 
-The **INTERFACES** panel is the at-a-glance half: one row per physical port,
+There was a third probe that queried a nonce label blocky could not have
+cached, to force a live round trip through the DoH upstream. It is **gone**: on
+a tethered uplink it spent roughly 285 ms of real bandwidth every tick to
+re-answer a question `internet` and `external ip` already settle. The DoH
+listener check is asked of the box now (`ss`) rather than probed by opening and
+dropping a TCP connection to `:443`, which logged a TLS handshake error on the
+Pi on every single tick.
+
+The viewer is **quiet when nothing is wrong**. The headline states whether the
+box is doing what the profile promised — `as declared`, or the faults named in
+red — and rows that would only ever say "nothing to report" are not printed at
+all: no portal line unless a window is open, no MAC line unless a pin is held,
+no VPN section on a profile that declares no VPN.
+
+The **INTERFACES** panel is the at-a-glance half: one row per port,
 each with a small filled block at the left — a port LED on a switch faceplate.
 Green for up and addressed, amber for associated but no lease yet, red for no
 carrier, grey for a leg with no job in this profile (`wlan0` under
 `hotel-eth`). Roles follow the profile, so the row labelled `uplink` moves
 between `wlan0` and `eth0` on its own, and an idle leg reads as idle rather
 than as a fault.
+
+`wg0` is a port too. It is not physical, but it is where you look to ask "is my
+traffic protected", and that belongs beside the legs it rides on. It reports
+the **handshake** when up — the only proof the tunnel reaches its peer — and,
+crucially, distinguishes *configured but unused by this profile* (grey,
+`not used by 'home'`) from *missing where the profile requires it* (red,
+`required by 'hotel-wifi'`). Calling the first "not configured" would send you
+hunting for a `wg0.conf` that is present and correct.
 
 The lamp is two blank cells carrying a background colour rather than a block
 glyph, so it is a solid rectangle in any font; two cells because a terminal
