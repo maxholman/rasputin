@@ -52,6 +52,10 @@ if command -v curl >/dev/null; then echo "extip $(curl -s --max-time 2 https://1
 else echo "extip nocurl"; fi
 s wg;       wg show wg0 2>/dev/null
 s addrs;    ip -br addr show 2>/dev/null
+s netdev;   cat /proc/net/dev
+s wlan0;    iw dev wlan0 link 2>/dev/null
+s ethlink;  echo "speed $(cat /sys/class/net/eth0/speed 2>/dev/null || echo -)"
+            echo "carrier $(cat /sys/class/net/eth0/carrier 2>/dev/null || echo 0)"
 s apinfo;   iw dev wlan1 info 2>/dev/null
 s stations; iw dev wlan1 station dump 2>/dev/null
 s leases;   cat /var/lib/misc/dnsmasq.leases 2>/dev/null
@@ -225,6 +229,15 @@ struct Status {
     wan_tcp: String,   // TCP 1.1.1.1:443 from the box: "open 34" (ms) | "no-path"
     wan_extip: String, // per https://1.1.1.1/cdn-cgi/trace; "" if unreachable, "nocurl" if no curl
     ifaces: HashMap<String, String>, // name → `ip -br addr` remainder: "UP 10.6.141.1/24 ..."
+    // Since-boot byte counters straight from /proc/net/dev, and the per-second
+    // rates the collector derives from consecutive samples. Totals are
+    // since-boot rather than since-launch so that --once, which has no previous
+    // sample to diff against, still reports something true.
+    netdev: ByteCounters, // since boot
+    rates: ByteCounters,  // per second; empty on the first tick, which has nothing to diff
+    wlan0_link: String,                  // `iw dev wlan0 link`
+    eth_speed: String,                   // Mb/s, or "-" when the link is down
+    eth_carrier: bool,
     wg: String,
     ap_ssid: String,
     ap_channel: String,
@@ -284,6 +297,31 @@ fn collect(opts: &Opts, host: &str, sudo_pw: Option<&str>) -> Status {
                 }
             }
             st.wg = sections.get("wg").cloned().unwrap_or_default();
+            // "  wlan0: 1234 56 0 0 0 0 0 0  789 12 ..." - field 0 of the
+            // remainder is rx bytes, field 8 is tx bytes.
+            if let Some(nd) = sections.get("netdev") {
+                for line in nd.lines() {
+                    let Some((name, rest)) = line.split_once(':') else { continue };
+                    let f: Vec<&str> = rest.split_whitespace().collect();
+                    if f.len() < 9 {
+                        continue;
+                    }
+                    if let (Ok(rx), Ok(tx)) = (f[0].parse(), f[8].parse()) {
+                        st.netdev.insert(name.trim().to_string(), (rx, tx));
+                    }
+                }
+            }
+            st.wlan0_link = sections.get("wlan0").cloned().unwrap_or_default();
+            if let Some(el) = sections.get("ethlink") {
+                for line in el.lines() {
+                    if let Some(v) = line.trim().strip_prefix("speed ") {
+                        st.eth_speed = v.trim().to_string();
+                    }
+                    if let Some(v) = line.trim().strip_prefix("carrier ") {
+                        st.eth_carrier = v.trim() == "1";
+                    }
+                }
+            }
             if let Some(addrs) = sections.get("addrs") {
                 for line in addrs.lines() {
                     if let Some((name, rest)) = line.trim().split_once(char::is_whitespace) {
@@ -463,16 +501,6 @@ fn uplink_if(profile: &str) -> Option<&'static str> {
     }
 }
 
-/// `UP 10.6.141.1/24 fe80::1/64` → `UP · 10.6.141.1/24` (first IPv4 only)
-fn fmt_ifaddr(raw: &str) -> String {
-    let mut it = raw.split_whitespace();
-    let state = it.next().unwrap_or("?").to_string();
-    match it.find(|a| a.contains('.')) {
-        Some(v4) => format!("{state} · {v4}"),
-        None => format!("{state} · no address"),
-    }
-}
-
 fn fmt_uptime(secs: u64) -> String {
     let (d, rem) = (secs / 86400, secs % 86400);
     let (h, m) = (rem / 3600, (rem % 3600) / 60);
@@ -500,6 +528,116 @@ fn fmt_channel(raw: &str) -> String {
         Some(width) => format!("ch {ch} · {}", width.trim()),
         None => format!("ch {ch}"),
     }
+}
+
+/// One physical port, as a switch's front panel would show it.
+#[derive(PartialEq, Clone, Copy)]
+enum PortState {
+    Up,      // carrier and an address - the only green state
+    NoAddr,  // link up, DHCP has not landed yet
+    Down,    // no carrier
+    Unused,  // has no role in this profile, so "down" would be a false alarm
+    Unknown, // unknown profile, or the interface was not reported at all
+}
+
+/// iface → (rx bytes, tx bytes). Counters when sampled, bytes/sec once diffed.
+type ByteCounters = HashMap<String, (u64, u64)>;
+
+struct Port {
+    role: &'static str,
+    iface: &'static str,
+    state: PortState,
+    addr: String,
+    detail: String,
+    rate: Option<(u64, u64)>,
+    total: (u64, u64),
+}
+
+/// 13002342 → "12.4M". At most five columns wide, so the rate fields align.
+fn fmt_bytes(n: u64) -> String {
+    for (unit, suffix) in [(1u64 << 30, "G"), (1 << 20, "M"), (1 << 10, "K")] {
+        if n >= unit {
+            let v = n as f64 / unit as f64;
+            return if v < 100.0 { format!("{v:.1}{suffix}") } else { format!("{v:.0}{suffix}") };
+        }
+    }
+    format!("{n}")
+}
+
+/// `SSID: venuewifi` + `signal: -58 dBm` → `venuewifi · -58 dBm`
+fn wifi_detail(link: &str) -> String {
+    let (mut ssid, mut signal) = (String::new(), String::new());
+    for line in link.lines() {
+        let line = line.trim();
+        if let Some(v) = line.strip_prefix("SSID:") {
+            ssid = v.trim().to_string();
+        }
+        if let Some(v) = line.strip_prefix("signal:") {
+            signal = v.trim().to_string();
+        }
+    }
+    match (ssid.is_empty(), signal.is_empty()) {
+        (false, false) => format!("{ssid} · {signal}"),
+        (false, true) => ssid,
+        (true, false) => signal,
+        (true, true) => "not associated".into(),
+    }
+}
+
+fn ports(st: &Status) -> Vec<Port> {
+    let profile = st.netmode.get("profile").cloned().unwrap_or_default();
+    let up_if = uplink_if(&profile);
+    let mut out = Vec::new();
+    for iface in ["wlan0", "wlan1", "eth0"] {
+        // wlan1 is the AP by hardware invariant; the other two swap roles with
+        // the profile, and whichever is not the uplink in `uplink` mode has no
+        // job at all - rendering that one red would be a false alarm.
+        let role = match (iface, up_if) {
+            ("wlan1", _) => "ap",
+            (i, Some(u)) if i == u => "uplink",
+            (_, None) => "?",
+            ("eth0", _) => "lan",
+            _ => "—",
+        };
+        let raw = st.ifaces.get(iface);
+        let carrier = raw.map(|r| r.split_whitespace().next() == Some("UP")).unwrap_or(false);
+        let addr = raw
+            .and_then(|r| r.split_whitespace().find(|a| a.contains('.')))
+            .unwrap_or("—")
+            .to_string();
+        let state = match (raw.is_some(), role, carrier, addr.as_str()) {
+            (false, _, _, _) => PortState::Unknown,
+            (_, "?", _, _) => PortState::Unknown,
+            (_, "—", _, _) => PortState::Unused,
+            (_, _, false, _) => PortState::Down,
+            (_, _, true, "—") => PortState::NoAddr,
+            _ => PortState::Up,
+        };
+        let detail = match iface {
+            "wlan0" => wifi_detail(&st.wlan0_link),
+            // Channel WIDTH is dropped here on purpose: in a port list the
+            // station count earns the space more than "80 MHz" does, and the
+            // full channel string is still in the LAN section below.
+            "wlan1" => format!(
+                "ch{} · {} sta",
+                st.ap_channel.split_whitespace().next().unwrap_or("?"),
+                st.station_signals.len()
+            ),
+            _ if !st.eth_carrier => "no carrier".into(),
+            _ if st.eth_speed == "-" || st.eth_speed.is_empty() => "link up".into(),
+            _ => format!("{} Mb/s", st.eth_speed),
+        };
+        out.push(Port {
+            role,
+            iface,
+            state,
+            addr,
+            detail,
+            rate: st.rates.get(iface).copied(),
+            total: st.netdev.get(iface).copied().unwrap_or((0, 0)),
+        });
+    }
+    out
 }
 
 struct Judged {
@@ -587,7 +725,15 @@ fn wg_summary(st: &Status) -> Option<String> {
 // verified present; a declared absence ("down" on a no-VPN profile) is a plain
 // fact, stated with its reason and no tick. --once stays uncoloured for scripts.
 
-fn build_lines(st: &Status, plain: &Style, dim: &Style, bad: &Style, good: &Style) -> Vec<Line<'static>> {
+fn build_lines(
+    st: &Status,
+    plain: &Style,
+    dim: &Style,
+    bad: &Style,
+    good: &Style,
+    width: usize,
+    colour: bool,
+) -> Vec<Line<'static>> {
     let j = judge(st);
     let label = |s: &str| Span::styled(format!("   {s:<12}"), *dim);
     let kv = |k: &str, v: String, style: &Style| {
@@ -634,17 +780,57 @@ fn build_lines(st: &Status, plain: &Style, dim: &Style, bad: &Style, good: &Styl
     lines.push(Line::from(headline));
     lines.push(Line::default());
 
+    // The port panel. Colour carries the verdict here rather than a ✓, because
+    // the point is to read three ports at a glance from across a hotel room:
+    // green = carrying traffic, amber = up but no address yet, red = down.
+    lines.push(section("INTERFACES"));
+    let w = width.max(40);
+    let hdr = " role     iface  state  address            link                  ↓/s     ↑/s      total ↓ / ↑";
+    lines.push(Line::from(Span::styled(
+        if colour { pad(hdr, w) } else { hdr.to_string() },
+        *dim,
+    )));
+    for p in ports(st) {
+        let (rx, tx) = match p.rate {
+            Some((rx, tx)) => (fmt_bytes(rx), fmt_bytes(tx)),
+            None => ("—".into(), "—".into()),
+        };
+        let row = format!(
+            " {:<8} {:<6} {:<6} {:<18} {:<20} {:>7} {:>7}   {:>6} / {:<6}",
+            p.role,
+            p.iface,
+            match p.state {
+                PortState::Up => "UP",
+                PortState::NoAddr => "UP",
+                PortState::Down => "DOWN",
+                PortState::Unused => "—",
+                PortState::Unknown => "?",
+            },
+            trunc(&p.addr, 18),
+            trunc(&p.detail, 20),
+            rx,
+            tx,
+            fmt_bytes(p.total.0),
+            fmt_bytes(p.total.1),
+        );
+        // --once is piped into scripts, so it stays uncoloured and the row is
+        // trimmed rather than padded out to the terminal width.
+        let style = if !colour {
+            *plain
+        } else {
+            match p.state {
+                PortState::Up => Style::default().bg(Color::Green).fg(Color::Black),
+                PortState::NoAddr => Style::default().bg(Color::Yellow).fg(Color::Black),
+                PortState::Down => Style::default().bg(Color::Red).fg(Color::White),
+                PortState::Unused => Style::default().bg(Color::DarkGray).fg(Color::Black),
+                PortState::Unknown => *plain,
+            }
+        };
+        lines.push(Line::from(Span::styled(if colour { pad(&row, w) } else { row }, style)));
+    }
+    lines.push(Line::default());
+
     lines.push(section("WAN"));
-    let upif = uplink_if(&profile);
-    let uplink = match upif {
-        Some(i) => {
-            let a = st.ifaces.get(i).map(|r| fmt_ifaddr(r)).unwrap_or_else(|| "?".into());
-            let bad = a.contains("DOWN") || a.contains("no address");
-            (format!("{i} · {a}"), bad)
-        }
-        None => ("?".to_string(), false),
-    };
-    lines.push(kv("uplink", uplink.0, pick(uplink.1)));
     let gw = match st.wan_gw.as_str() {
         "" => ("?".to_string(), false),
         "none" => ("NO DEFAULT ROUTE".to_string(), true),
@@ -687,6 +873,15 @@ fn build_lines(st: &Status, plain: &Style, dim: &Style, bad: &Style, good: &Styl
         ip => (ip.to_string(), false),
     };
     lines.push(kv("external ip", extip.0, pick(extip.1)));
+    // Red for as long as the window is open: the tunnel is down and clients are
+    // loose on :80/:443, which is a state you want to leave, not settle into.
+    if let Some(portal) = st.netmode.get("portal") {
+        let open = portal.starts_with("OPEN");
+        lines.push(kv("portal", portal.clone(), pick(open)));
+    }
+    if let Some(mac) = st.netmode.get("uplink mac") {
+        lines.push(kv("uplink mac", mac.clone(), if mac.contains("NOT APPLIED") { bad } else { dim }));
+    }
     lines.push(Line::default());
 
     lines.push(section("VPN"));
@@ -715,14 +910,7 @@ fn build_lines(st: &Status, plain: &Style, dim: &Style, bad: &Style, good: &Styl
     if !st.ap_channel.is_empty() {
         ap = format!("{ap} · {}", fmt_channel(&st.ap_channel));
     }
-    if let Some(a) = st.ifaces.get("wlan1") {
-        ap = format!("{ap} · {}", fmt_ifaddr(a));
-    }
-    lines.push(kv("wlan1 (AP)", ap, plain));
-    if upif != Some("eth0") {
-        let eth = st.ifaces.get("eth0").map(|r| fmt_ifaddr(r)).unwrap_or_else(|| "?".into());
-        lines.push(kv("eth0", eth, plain));
-    }
+    lines.push(kv("ssid", ap, plain));
     let stations = if st.station_signals.is_empty() {
         "none".to_string()
     } else {
@@ -773,6 +961,13 @@ fn build_lines(st: &Status, plain: &Style, dim: &Style, bad: &Style, good: &Styl
     };
     lines.push(kv("blocklist", blocklist.0, pick(blocklist.1)));
 
+    // A plaintext upstream means portal mode and nothing else, so it is red
+    // rather than merely stated.
+    if let Some(ups) = st.netmode.get("dns upstream") {
+        let plain_dns = ups.starts_with("PLAINTEXT");
+        lines.push(kv("upstreams", ups.clone(), pick(plain_dns)));
+    }
+
     let doh = match st.doh_listening {
         Some(true) => ("listening ✓".to_string(), false),
         Some(false) => ("NOT REACHABLE".to_string(), true),
@@ -781,6 +976,21 @@ fn build_lines(st: &Status, plain: &Style, dim: &Style, bad: &Style, good: &Styl
     lines.push(kv("doh :443", doh.0, pick(doh.1)));
 
     lines
+}
+
+/// Pad to the panel width so a row's background reaches the right border.
+/// Counts chars, not bytes: the header carries ↓ and ↑.
+fn pad(s: &str, w: usize) -> String {
+    let n = s.chars().count();
+    if n >= w {
+        s.chars().take(w).collect()
+    } else {
+        format!("{s}{}", " ".repeat(w - n))
+    }
+}
+
+fn trunc(s: &str, w: usize) -> String {
+    if s.chars().count() <= w { s.to_string() } else { s.chars().take(w - 1).chain(['…']).collect() }
 }
 
 fn title_line(st: &Status) -> String {
@@ -801,7 +1011,7 @@ fn print_once(st: &Status) {
     if let Some(e) = &st.error {
         let _ = writeln!(out, " collection error: {e}");
     }
-    for line in build_lines(st, &plain, &plain, &plain, &plain) {
+    for line in build_lines(st, &plain, &plain, &plain, &plain, 0, false) {
         let text: String = line.iter().map(|s| s.content.as_ref()).collect();
         let _ = writeln!(out, "{}", text.trim_end());
     }
@@ -824,12 +1034,37 @@ fn run_tui(opts: &Opts, host: String, sudo_pw: Option<String>) {
             sudo_pass_file: None,
         };
         let host = host.clone();
-        std::thread::spawn(move || loop {
-            let st = collect(&opts, &host, sudo_pw.as_deref());
-            if tx.send(st).is_err() {
-                return;
+        std::thread::spawn(move || {
+            // Rates need two samples, so the previous one lives here rather
+            // than in Status - nothing is written to disk and nothing is kept
+            // on the Pi. The first tick therefore has no rate to report.
+            let mut prev: Option<(Instant, ByteCounters)> = None;
+            loop {
+                let mut st = collect(&opts, &host, sudo_pw.as_deref());
+                if let Some((taken, old)) = &prev {
+                    let dt = taken.elapsed().as_secs_f64();
+                    if dt > 0.2 {
+                        for (iface, &(rx, tx_b)) in &st.netdev {
+                            let Some(&(orx, otx)) = old.get(iface) else { continue };
+                            // saturating: a MAC change or driver reload resets
+                            // the kernel counters, and a negative delta would
+                            // otherwise wrap into a nonsense gigabit spike.
+                            st.rates.insert(
+                                iface.clone(),
+                                (
+                                    (rx.saturating_sub(orx) as f64 / dt) as u64,
+                                    (tx_b.saturating_sub(otx) as f64 / dt) as u64,
+                                ),
+                            );
+                        }
+                    }
+                }
+                prev = Some((Instant::now(), st.netdev.clone()));
+                if tx.send(st).is_err() {
+                    return;
+                }
+                std::thread::sleep(interval);
             }
-            std::thread::sleep(interval);
         });
     }
 
@@ -862,7 +1097,10 @@ fn run_tui(opts: &Opts, host: String, sudo_pw: Option<String>) {
                 let content = if latest.taken_at.is_none() && latest.error.is_none() {
                     vec![Line::default(), Line::from(" connecting...")]
                 } else {
-                    build_lines(&latest, &plain, &dim, &bad, &good)
+                    // Inside the border, so the port rows' background stops
+                    // exactly at it rather than bleeding over or falling short.
+                    let inner = body.width.saturating_sub(2) as usize;
+                    build_lines(&latest, &plain, &dim, &bad, &good, inner, true)
                 };
                 f.render_widget(Paragraph::new(content).block(block), body);
 
@@ -930,4 +1168,101 @@ fn main() {
     }
 
     run_tui(&opts, host, sudo_pw);
+}
+
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn st(profile: &str) -> Status {
+        let mut s = Status::default();
+        s.netmode.insert("profile".into(), profile.into());
+        s.ifaces.insert("wlan0".into(), "UP 10.31.4.88/24 fe80::1/64".into());
+        s.ifaces.insert("wlan1".into(), "UP 10.9.141.1/24".into());
+        s.ifaces.insert("eth0".into(), "UP 10.6.141.1/24".into());
+        s.wlan0_link = "Connected to aa:bb\n\tSSID: venuewifi\n\tsignal: -58 dBm".into();
+        s.eth_carrier = true;
+        s.eth_speed = "1000".into();
+        s.ap_channel = "36 (5180 MHz), width: 80 MHz".into();
+        s.station_signals = vec![-50, -61, -44];
+        s.netdev.insert("wlan0".into(), (4_509_715_660, 849_346_662));
+        s.netdev.insert("wlan1".into(), (1_234_567, 89_000));
+        s.netdev.insert("eth0".into(), (860_160, 94_208));
+        s.rates.insert("wlan0".into(), (13_002_342, 3_250_585));
+        s.rates.insert("wlan1".into(), (1_258_291, 245_760));
+        s.rates.insert("eth0".into(), (860_160, 94_208));
+        s
+    }
+
+    #[test]
+    fn bytes_stay_narrow() {
+        assert_eq!(fmt_bytes(0), "0");
+        assert_eq!(fmt_bytes(999), "999");
+        assert_eq!(fmt_bytes(1024), "1.0K");
+        assert_eq!(fmt_bytes(860_160), "840K");
+        assert_eq!(fmt_bytes(13_002_342), "12.4M");
+        assert_eq!(fmt_bytes(4_509_715_660), "4.2G");
+    }
+
+    #[test]
+    fn wifi_detail_survives_missing_halves() {
+        assert_eq!(wifi_detail("\tSSID: foo\n\tsignal: -58 dBm"), "foo · -58 dBm");
+        assert_eq!(wifi_detail("\tSSID: foo"), "foo");
+        assert_eq!(wifi_detail(""), "not associated");
+    }
+
+    #[test]
+    fn roles_follow_the_profile() {
+        let p = ports(&st("hotel-wifi"));
+        assert_eq!(p.iter().map(|p| p.role).collect::<Vec<_>>(), ["uplink", "ap", "lan"]);
+        // eth0 takes the WAN in hotel-eth, which leaves wlan0 with no job.
+        let p = ports(&st("hotel-eth"));
+        assert_eq!(p.iter().map(|p| p.role).collect::<Vec<_>>(), ["—", "ap", "uplink"]);
+        assert!(p[0].state == PortState::Unused, "an idle leg must not read as a fault");
+    }
+
+    #[test]
+    fn state_separates_no_carrier_from_no_lease() {
+        let mut s = st("home");
+        s.ifaces.insert("eth0".into(), "DOWN".into());
+        assert!(ports(&s)[2].state == PortState::Down);
+
+        let mut s = st("home");
+        s.ifaces.insert("wlan0".into(), "UP fe80::1/64".into());
+        assert!(ports(&s)[0].state == PortState::NoAddr, "associated but unleased is amber, not red");
+
+        // An unknown profile means no roles are known, so nothing is judged.
+        let s = st("something-new");
+        assert!(ports(&s).iter().all(|p| p.state == PortState::Unknown || p.role == "ap"));
+    }
+
+    /// The port rows carry a background colour, so they are padded to the panel
+    /// width exactly - one char over and the row wraps, taking its green with it.
+    #[test]
+    fn port_rows_are_exactly_panel_width() {
+        for w in [40usize, 80, 100, 140] {
+            let lines = build_lines(&st("hotel-wifi"), &Style::default(), &Style::default(),
+                                    &Style::default(), &Style::default(), w, true);
+            let start = lines.iter().position(|l| {
+                l.iter().map(|s| s.content.as_ref()).collect::<String>().trim() == "INTERFACES"
+            }).expect("panel is rendered");
+            let rows: Vec<usize> = lines[start + 1..].iter()
+                .map(|l| l.iter().map(|s| s.content.chars().count()).sum())
+                .take_while(|&n| n > 0)
+                .collect();
+            assert_eq!(rows.len(), 4, "a header and three ports at width {w}");
+            assert!(rows.iter().all(|&n| n == w.max(40)), "width {w} gave rows {rows:?}");
+        }
+    }
+
+    #[test]
+    fn show_the_panel() {
+        for line in build_lines(&st("hotel-wifi"), &Style::default(), &Style::default(),
+                                &Style::default(), &Style::default(), 0, false).iter().take(9) {
+            let t: String = line.iter().map(|s| s.content.as_ref()).collect();
+            println!("{}", t.trim_end());
+        }
+    }
 }
