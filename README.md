@@ -483,12 +483,18 @@ nonce label blocky cannot have cached, forcing a live round trip through the
 DoH upstream: NXDOMAIN is healthy, SERVFAIL means blocky is up but its
 upstream (or the uplink) is dead.
 
-The **INTERFACES** panel is the at-a-glance half: one full-width row per
-physical port, the whole row painted by state — green for up and addressed,
-amber for associated but no lease yet, red for no carrier, grey for a leg with
-no job in this profile (`wlan0` under `hotel-eth`). Roles follow the profile,
-so the row labelled `uplink` moves between `wlan0` and `eth0` on its own, and
-an idle leg reads as idle rather than as a fault.
+The **INTERFACES** panel is the at-a-glance half: one row per physical port,
+each with a small filled block at the left — a port LED on a switch faceplate.
+Green for up and addressed, amber for associated but no lease yet, red for no
+carrier, grey for a leg with no job in this profile (`wlan0` under
+`hotel-eth`). Roles follow the profile, so the row labelled `uplink` moves
+between `wlan0` and `eth0` on its own, and an idle leg reads as idle rather
+than as a fault.
+
+The lamp is two blank cells carrying a background colour rather than a block
+glyph, so it is a solid rectangle in any font; two cells because a terminal
+cell is about half as wide as it is tall. Colour is confined to it deliberately
+— a whole line of green drowns the numbers it is supposed to qualify.
 
 Traffic accounting is deliberately cheap. Per-second rates are diffed from
 `/proc/net/dev` between ticks and held in the viewer's memory; the totals are

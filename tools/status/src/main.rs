@@ -731,7 +731,6 @@ fn build_lines(
     dim: &Style,
     bad: &Style,
     good: &Style,
-    width: usize,
     colour: bool,
 ) -> Vec<Line<'static>> {
     let j = judge(st);
@@ -780,14 +779,19 @@ fn build_lines(
     lines.push(Line::from(headline));
     lines.push(Line::default());
 
-    // The port panel. Colour carries the verdict here rather than a ✓, because
-    // the point is to read three ports at a glance from across a hotel room:
-    // green = carrying traffic, amber = up but no address yet, red = down.
+    // The port panel. Each row carries a small filled block - a port LED on a
+    // switch faceplate - rather than a coloured row: the colour is the verdict,
+    // and a whole line of it drowns the numbers it is supposed to qualify.
+    // Two cells wide, because a terminal cell is about half as wide as it is
+    // tall, so two of them read as a square.
     lines.push(section("INTERFACES"));
-    let w = width.max(40);
-    let hdr = " role     iface  state  address            link                  ↓/s     ↑/s      total ↓ / ↑";
+    // Header and rows share one format string so their columns cannot drift
+    // apart; the three leading spaces match the row's margin plus its lamp.
+    let cells = |a: &str, b: &str, c: &str, d: &str, e: &str, f: &str, g: &str, h: &str, i: &str| {
+        format!(" {a:<8} {b:<6} {c:<6} {d:<18} {e:<20} {f:>7} {g:>7}   {h:>6} / {i:<6}")
+    };
     lines.push(Line::from(Span::styled(
-        if colour { pad(hdr, w) } else { hdr.to_string() },
+        format!("   {}", cells("role", "iface", "state", "address", "link", "↓/s", "↑/s", "total↓", "↑")),
         *dim,
     )));
     for p in ports(st) {
@@ -795,38 +799,44 @@ fn build_lines(
             Some((rx, tx)) => (fmt_bytes(rx), fmt_bytes(tx)),
             None => ("—".into(), "—".into()),
         };
-        let row = format!(
-            " {:<8} {:<6} {:<6} {:<18} {:<20} {:>7} {:>7}   {:>6} / {:<6}",
-            p.role,
-            p.iface,
-            match p.state {
-                PortState::Up => "UP",
-                PortState::NoAddr => "UP",
-                PortState::Down => "DOWN",
-                PortState::Unused => "—",
-                PortState::Unknown => "?",
-            },
-            trunc(&p.addr, 18),
-            trunc(&p.detail, 20),
-            rx,
-            tx,
-            fmt_bytes(p.total.0),
-            fmt_bytes(p.total.1),
-        );
-        // --once is piped into scripts, so it stays uncoloured and the row is
-        // trimmed rather than padded out to the terminal width.
-        let style = if !colour {
-            *plain
-        } else {
-            match p.state {
-                PortState::Up => Style::default().bg(Color::Green).fg(Color::Black),
-                PortState::NoAddr => Style::default().bg(Color::Yellow).fg(Color::Black),
-                PortState::Down => Style::default().bg(Color::Red).fg(Color::White),
-                PortState::Unused => Style::default().bg(Color::DarkGray).fg(Color::Black),
-                PortState::Unknown => *plain,
-            }
+        // Background on blank cells, not a block glyph: a solid rectangle in
+        // every font, including those with no U+2588.
+        let lamp = match p.state {
+            PortState::Up => Some(Color::Green),
+            PortState::NoAddr => Some(Color::Yellow),
+            PortState::Down => Some(Color::Red),
+            PortState::Unused => Some(Color::DarkGray),
+            PortState::Unknown => None,
         };
-        lines.push(Line::from(Span::styled(if colour { pad(&row, w) } else { row }, style)));
+        let lamp_span = match (colour, lamp) {
+            (true, Some(c)) => Span::styled("  ", Style::default().bg(c)),
+            // --once is piped into scripts, so it stays uncoloured; the state
+            // column already carries the same fact in words.
+            _ => Span::styled("  ", *plain),
+        };
+        lines.push(Line::from(vec![
+            Span::raw(" "),
+            lamp_span,
+            Span::styled(
+                cells(
+                    p.role,
+                    p.iface,
+                    match p.state {
+                        PortState::Up | PortState::NoAddr => "UP",
+                        PortState::Down => "DOWN",
+                        PortState::Unused => "—",
+                        PortState::Unknown => "?",
+                    },
+                    &trunc(&p.addr, 18),
+                    &trunc(&p.detail, 20),
+                    &rx,
+                    &tx,
+                    &fmt_bytes(p.total.0),
+                    &fmt_bytes(p.total.1),
+                ),
+                *plain,
+            ),
+        ]));
     }
     lines.push(Line::default());
 
@@ -978,17 +988,6 @@ fn build_lines(
     lines
 }
 
-/// Pad to the panel width so a row's background reaches the right border.
-/// Counts chars, not bytes: the header carries ↓ and ↑.
-fn pad(s: &str, w: usize) -> String {
-    let n = s.chars().count();
-    if n >= w {
-        s.chars().take(w).collect()
-    } else {
-        format!("{s}{}", " ".repeat(w - n))
-    }
-}
-
 fn trunc(s: &str, w: usize) -> String {
     if s.chars().count() <= w { s.to_string() } else { s.chars().take(w - 1).chain(['…']).collect() }
 }
@@ -1011,7 +1010,7 @@ fn print_once(st: &Status) {
     if let Some(e) = &st.error {
         let _ = writeln!(out, " collection error: {e}");
     }
-    for line in build_lines(st, &plain, &plain, &plain, &plain, 0, false) {
+    for line in build_lines(st, &plain, &plain, &plain, &plain, false) {
         let text: String = line.iter().map(|s| s.content.as_ref()).collect();
         let _ = writeln!(out, "{}", text.trim_end());
     }
@@ -1097,10 +1096,7 @@ fn run_tui(opts: &Opts, host: String, sudo_pw: Option<String>) {
                 let content = if latest.taken_at.is_none() && latest.error.is_none() {
                     vec![Line::default(), Line::from(" connecting...")]
                 } else {
-                    // Inside the border, so the port rows' background stops
-                    // exactly at it rather than bleeding over or falling short.
-                    let inner = body.width.saturating_sub(2) as usize;
-                    build_lines(&latest, &plain, &dim, &bad, &good, inner, true)
+                    build_lines(&latest, &plain, &dim, &bad, &good, true)
                 };
                 f.render_widget(Paragraph::new(content).block(block), body);
 
@@ -1238,29 +1234,80 @@ mod tests {
         assert!(ports(&s).iter().all(|p| p.state == PortState::Unknown || p.role == "ap"));
     }
 
-    /// The port rows carry a background colour, so they are padded to the panel
-    /// width exactly - one char over and the row wraps, taking its green with it.
+    /// The three port rows, taken by position from the INTERFACES section.
+    /// Matching on interface names instead would also catch the profile
+    /// headline, which reads "WAN wlan0 · LAN eth0 · no VPN".
+    fn port_rows(state: &Status, colour: bool) -> Vec<Line<'static>> {
+        let d = Style::default();
+        let lines = build_lines(state, &d, &d, &d, &d, colour);
+        let start = lines
+            .iter()
+            .position(|l| l.iter().map(|s| s.content.as_ref()).collect::<String>().trim() == "INTERFACES")
+            .expect("panel is rendered");
+        lines[start + 2..start + 5].to_vec() // skip the section title and the column header
+    }
+
+    /// The lamp is the only span that is exactly two blank cells.
+    fn lamps(profile: &str, colour: bool) -> Vec<Option<Color>> {
+        port_rows(&st(profile), colour)
+            .iter()
+            .map(|l| l.iter().find(|s| s.content == "  ").and_then(|s| s.style.bg))
+            .collect()
+    }
+
+    /// The lamp carries the verdict, so its colour per state is the invariant -
+    /// not the row width, now that rows are no longer painted edge to edge.
     #[test]
-    fn port_rows_are_exactly_panel_width() {
-        for w in [40usize, 80, 100, 140] {
-            let lines = build_lines(&st("hotel-wifi"), &Style::default(), &Style::default(),
-                                    &Style::default(), &Style::default(), w, true);
-            let start = lines.iter().position(|l| {
-                l.iter().map(|s| s.content.as_ref()).collect::<String>().trim() == "INTERFACES"
-            }).expect("panel is rendered");
-            let rows: Vec<usize> = lines[start + 1..].iter()
-                .map(|l| l.iter().map(|s| s.content.chars().count()).sum())
-                .take_while(|&n| n > 0)
-                .collect();
-            assert_eq!(rows.len(), 4, "a header and three ports at width {w}");
-            assert!(rows.iter().all(|&n| n == w.max(40)), "width {w} gave rows {rows:?}");
+    fn lamp_colour_states_the_verdict() {
+        assert_eq!(
+            lamps("hotel-wifi", true),
+            vec![Some(Color::Green), Some(Color::Green), Some(Color::Green)]
+        );
+        // wlan0 has no job under hotel-eth: grey, not the red of a fault.
+        assert_eq!(lamps("hotel-eth", true)[0], Some(Color::DarkGray));
+        // An unknown profile means the eth0/wlan0 roles are unknown, so neither
+        // is judged. wlan1 still is: it is the AP by hardware invariant,
+        // whatever the profile is called.
+        assert_eq!(lamps("something-new", true), vec![None, Some(Color::Green), None]);
+        // --once is piped, so nothing is coloured.
+        assert!(lamps("hotel-wifi", false).iter().all(|c| c.is_none()));
+    }
+
+    /// The header and the rows are generated from one format string; this
+    /// catches anyone reintroducing a hand-spaced header that drifts.
+    #[test]
+    fn header_columns_line_up_with_the_rows() {
+        let d = Style::default();
+        let lines = build_lines(&st("hotel-wifi"), &d, &d, &d, &d, false);
+        let text = |l: &Line| l.iter().map(|s| s.content.as_ref()).collect::<String>();
+        let start = lines.iter().position(|l| text(l).trim() == "INTERFACES").unwrap();
+        let hdr = text(&lines[start + 1]);
+        let row = text(&lines[start + 2]);
+        for (label, field) in [("iface", "wlan0"), ("state", "UP"), ("address", "10.31.4.88/24")] {
+            assert_eq!(
+                hdr.find(label),
+                row.find(field),
+                "column {label:?} starts at a different offset to {field:?}\n  {hdr}\n  {row}"
+            );
         }
+    }
+
+    #[test]
+    fn lamp_goes_amber_then_red_as_a_leg_degrades() {
+        let bg = |s: &Status| {
+            port_rows(s, true)[0].iter().find(|x| x.content == "  ").unwrap().style.bg
+        };
+        let mut s = st("home");
+        s.ifaces.insert("wlan0".into(), "UP fe80::1/64".into()); // associated, no lease
+        assert_eq!(bg(&s), Some(Color::Yellow), "associated but unleased is amber");
+        s.ifaces.insert("wlan0".into(), "DOWN".into());
+        assert_eq!(bg(&s), Some(Color::Red), "no carrier is red");
     }
 
     #[test]
     fn show_the_panel() {
         for line in build_lines(&st("hotel-wifi"), &Style::default(), &Style::default(),
-                                &Style::default(), &Style::default(), 0, false).iter().take(9) {
+                                &Style::default(), &Style::default(), false).iter().take(9) {
             let t: String = line.iter().map(|s| s.content.as_ref()).collect();
             println!("{}", t.trim_end());
         }
