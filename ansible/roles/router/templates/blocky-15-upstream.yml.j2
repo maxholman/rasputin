@@ -1,0 +1,27 @@
+# Which resolver blocky asks. Managed by NETMODE, which rewrites this on every
+# converge; Ansible writes it too so that a deploy with converge_on_deploy=false
+# still leaves blocky an upstream at all.
+#
+# It lives here rather than in 10-base.yml because it is the half that CHANGES:
+# `netmode portal` replaces the DoH endpoints below with the venue's own
+# resolver, in plaintext, for as long as a captive portal is being cleared.
+# netmode writes the whole `upstreams` block from one place so there is never a
+# question about how two config.d fragments merge.
+#
+# Keep this generator in step with write_blocky_upstream() in netmode.
+upstreams:
+  init:
+    # `fast` = start even when no upstream answers yet. A travel router boots
+    # before it has an uplink; `blocking` would leave us with no resolver at
+    # all until the venue's wifi came up.
+    strategy: fast
+  groups:
+    default:
+{% for u in blocky_upstreams %}
+      - {{ u }}
+{% endfor %}
+  # strict, not parallel_best: the first upstream is chosen for doing its own
+  # malware filtering, and racing it against one that doesn't would let the
+  # loser answer for domains the winner blocks.
+  strategy: strict
+  timeout: {{ blocky_upstream_timeout }}

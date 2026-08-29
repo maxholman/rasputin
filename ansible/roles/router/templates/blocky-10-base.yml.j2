@@ -3,27 +3,13 @@
 # Blocky owns :53; dnsmasq is demoted to DHCP-only (port=0). Config is a
 # DIRECTORY, merged in filename order with later files winning - the same
 # shape as /etc/dnsmasq.d. This file is the constant half; netmode owns
-# 20-listen.yml, which is the half that changes with the mode.
+# 15-upstream.yml and 20-listen.yml, the halves that change with the mode.
 
-# Every query leaves this box over TLS, in every profile. There is no
-# plaintext-DNS path to fall back to: the kill switch is enforced by the
-# output chain in netmode's ruleset, not by picking an unroutable upstream.
-upstreams:
-  init:
-    # `fast` = start even when no upstream answers yet. A travel router boots
-    # before it has an uplink; `blocking` would leave us with no resolver at
-    # all until the venue's wifi came up.
-    strategy: fast
-  groups:
-    default:
-{% for u in blocky_upstreams %}
-      - {{ u }}
-{% endfor %}
-  # strict, not parallel_best: the first upstream is chosen for doing its own
-  # malware filtering, and racing it against one that doesn't would let the
-  # loser answer for domains the winner blocks.
-  strategy: strict
-  timeout: {{ blocky_upstream_timeout }}
+# `upstreams` is NOT here. It lives in 15-upstream.yml, which netmode owns and
+# rewrites per converge, because it is the half that changes: clearing a
+# captive portal needs the venue's resolver in plaintext for a bounded window,
+# and one file written from one place beats reasoning about how two config.d
+# fragments merge. Every query leaves over TLS in every profile except that one.
 
 # Resolving the upstream's OWN hostname cannot go through the upstream.
 # {{ blocky_bootstrap }} is reachable by IP because its certificate carries IP

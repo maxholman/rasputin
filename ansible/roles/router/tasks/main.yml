@@ -197,15 +197,22 @@
 
 # wlan0 presents a fresh MAC to each SSID, and a random one while merely
 # scanning - otherwise the real MAC is broadcast before you ever associate.
+#
+# The regexp is load-bearing. Without it lineinfile matches the whole literal,
+# so when netmode has set mac_addr=0 to hold a captive-portal pin this APPENDS
+# a second mac_addr= line instead of replacing it, and the file carries both.
+# netmode re-asserts the pin on the converge at the end of a deploy, so a run
+# during a pinned session heals itself.
 - name: Randomise the wifi client MAC per network
   ansible.builtin.lineinfile:
     path: /etc/wpa_supplicant/wpa_supplicant.conf
-    line: "{{ item }}"
+    regexp: "^{{ item.key }}="
+    line: "{{ item.key }}={{ item.value }}"
     insertbefore: BOF
     state: "{{ 'present' if (randomize_client_mac | default(true) | bool) else 'absent' }}"
   loop:
-    - mac_addr=1
-    - preassoc_mac_addr=1
+    - { key: mac_addr, value: 1 }
+    - { key: preassoc_mac_addr, value: 1 }
   notify: restart wpa_supplicant
 
 # Stop announcing ourselves to every venue's DHCP server. `hostname` sends
@@ -409,6 +416,18 @@
   ansible.builtin.template:
     src: blocky-10-base.yml.j2
     dest: /etc/blocky/config.d/10-base.yml
+    mode: "0644"
+  notify: restart blocky
+
+# netmode rewrites this on every converge - the DoH endpoints normally, the
+# venue's own resolver in plaintext while a captive portal is being cleared.
+# Written here as well so a deploy with converge_on_deploy=false still leaves
+# blocky an upstream at all; a blocky with none fails to start, and this box
+# has no second resolver.
+- name: Resolver upstreams
+  ansible.builtin.template:
+    src: blocky-15-upstream.yml.j2
+    dest: /etc/blocky/config.d/15-upstream.yml
     mode: "0644"
   notify: restart blocky
 

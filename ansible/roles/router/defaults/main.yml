@@ -125,3 +125,20 @@ blocky_doh_port: 443
 # the client-side kill switch cannot see. The tunnel needs neither DNS nor a
 # correct clock (the peer is a literal IP), so this has no bootstrap deadlock.
 killswitch_restrict_output: true
+
+# ---------------------------------------------------------------------------
+# Captive portals. `netmode portal` opens a bounded hole - tunnel down, clients
+# limited to :80/:443, DNS plaintext to the venue's own resolver - for long
+# enough to complete a login page, then converges back to the declared profile
+# on its own. The window is the only thing standing between a hotel lobby and
+# an unprotected router, so it is short by default.
+# ---------------------------------------------------------------------------
+portal_timeout: 900
+
+# Addresses, not names: the probe has to work with DNS already broken. See
+# portal_probe() in netmode for why. Both are Cloudflare anycast for the same
+# service, so they answer from whichever continent you are on - add your own if
+# a venue blackholes them, keeping to endpoints that return 204.
+portal_probe_targets:
+  - { ip: 162.159.36.5, host: cp.cloudflare.com, path: /generate_204 }
+  - { ip: 162.159.46.5, host: cp.cloudflare.com, path: /generate_204 }

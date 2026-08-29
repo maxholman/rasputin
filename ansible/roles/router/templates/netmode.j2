@@ -1,16 +1,23 @@
 #!/usr/bin/env bash
 # netmode - declare which role {{ eth_if }} plays, then converge onto it.
 #
-#   netmode serve   {{ eth_if }} FEEDS the wired network - this is UniFi WAN
-#   netmode uplink  {{ eth_if }} TAKES an address from the venue ethernet
-#   netmode status  show declared vs actual
+#   netmode serve     {{ eth_if }} FEEDS the wired network - this is UniFi WAN
+#   netmode uplink    {{ eth_if }} TAKES an address from the venue ethernet
+#   netmode status    show declared vs actual
 #   netmode converge  re-apply the declared mode (runs at boot)
+#   netmode portal    open a bounded hole to clear a captive portal
+#   netmode mac-new   drop the pinned uplink MAC, take a fresh identity
 #
 # Managed by Ansible. Edit the role, not this file.
 set -euo pipefail
 
 STATE_DIR=/etc/netmode
 STATE="$STATE_DIR/mode"
+PORTAL_STATE="$STATE_DIR/portal"
+MAC_PIN="$STATE_DIR/mac-pin"
+PORTAL_TIMEOUT={{ portal_timeout | default(900) }}
+PORTAL_URL=""
+PORTAL_UPLINK=""
 ETH={{ eth_if }}
 AP={{ ap_if }}
 WIFI={{ wan_wifi_if }}
@@ -63,7 +70,7 @@ write_dhcpcd_block() {
 # Admin (SSH) and DNS are bound to whatever is LAN *in this mode*, never to the
 # uplink. On a travel router the uplink is hostile by definition.
 apply_firewall() {
-  local uplink="$1" mode="$2" vpn="${3:-0}" lan_list admin_list egress
+  local uplink="$1" mode="$2" vpn="${3:-0}" portal="${4:-0}" lan_list admin_list egress
   # THE KILL SWITCH. With the VPN up, the tunnel is the only permitted exit.
   # If wg0 disappears, no forward rule matches and policy drop takes over -
   # clients lose connectivity rather than silently egressing in the clear.
@@ -129,6 +136,16 @@ apply_firewall() {
     lateral="${lateral}    iifname @lan_ifaces oifname \"$uplink\" ip daddr $upnet drop"
   else
     echo "netmode: WARNING - $uplink has no address; venue-lateral rules NOT installed" >&2
+  fi
+
+  # Portal mode swaps the blanket "anything out the uplink" accept for a
+  # web-only one. The venue-subnet drop above still stands, so the other guests
+  # stay unreachable for the whole time the login page is open - the hole is in
+  # what protocols may leave, never in who may be reached.
+  local egress_rule="    iifname @lan_ifaces oifname \"$egress\" accept"
+  if [[ $portal == 1 ]]; then
+    egress_rule="    # CAPTIVE PORTAL MODE: web only, and only long enough to log in.
+    iifname @lan_ifaces oifname \"$uplink\" tcp dport { 80, 443 } accept"
   fi
   # THE OTHER HALF OF THE KILL SWITCH. The forward chain stops CLIENTS leaking
   # when the tunnel drops; nothing stopped traffic this box originates itself.
@@ -231,7 +248,7 @@ $lateral
     iifname @lan_ifaces oifname "$uplink" udp dport { 5353, 5355, 1900, 137, 138 } drop
     iifname @lan_ifaces oifname "$uplink" tcp dport { 139, 445 } drop
 
-    iifname @lan_ifaces oifname "$egress" accept
+$egress_rule
     iifname @lan_ifaces oifname @lan_ifaces accept
     # uplink -> LAN is only ever reply traffic, matched by the ct rule above
   }
@@ -328,25 +345,90 @@ cancel_rollback() {
 # A locally-administered, unicast MAC. Only ever applied to the interface
 # facing the venue - never to a LAN leg, where a changing MAC would break
 # every client's ARP cache and our own DHCP reservations.
+set_mac() {
+  local ifc="$1" mac="$2" rc=0
+  ip link set dev "$ifc" down 2>/dev/null || true
+  ip link set dev "$ifc" address "$mac" 2>/dev/null || rc=1
+  ip link set dev "$ifc" up 2>/dev/null || true
+  return $rc
+}
+
 randomize_mac() {
   local ifc="$1" mac
   mac=$(printf '02:%02x:%02x:%02x:%02x:%02x' \
         $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)))
-  ip link set dev "$ifc" down 2>/dev/null || true
-  if ip link set dev "$ifc" address "$mac" 2>/dev/null; then
+  if set_mac "$ifc" "$mac"; then
     echo "netmode: $ifc MAC randomised to $mac"
   else
     echo "netmode: WARNING - could not randomise MAC on $ifc" >&2
   fi
-  ip link set dev "$ifc" up 2>/dev/null || true
 }
 
-# brcmfmac (the Pi's built-in wifi) advertises scan randomisation but NOT
-# per-ESS association randomisation, so wpa_supplicant's mac_addr=1 silently
-# does nothing. It does accept `ip link set address` though, so the MAC is set
-# directly and the supplicant restarted to associate using it.
+WPA_CONF=/etc/wpa_supplicant/wpa_supplicant.conf
+
+# wpa_supplicant applies its OWN per-ESS randomisation (mac_addr=1) at
+# association time, and it overwrites whatever `ip link set address` put there.
+# Proven on this hardware: a converge set 02:c7:fc:e9:3d:56 and the interface
+# came up wearing 8a:db:56:49:f7:6f. So holding a MAC means turning that off
+# for as long as the pin lasts, and turning it back on when the pin is dropped.
+# With mac_addr=0 the supplicant leaves an externally-set address alone - it
+# does NOT restore the permanent one, which was the risk worth testing.
+set_wpa_randomisation() {
+  local want="$1"   # 1 = supplicant randomises per ESS; 0 = netmode owns the MAC
+  [[ -f $WPA_CONF ]] || return 0
+  # Delete-then-insert rather than substitute: Ansible writes this line too, and
+  # a config carrying both mac_addr=0 and mac_addr=1 is ambiguous about which
+  # wins. Collapsing to exactly one is the point, not just setting the value.
+  [[ $(grep -c '^mac_addr=' "$WPA_CONF") -eq 1 ]] \
+    && grep -q "^mac_addr=${want}$" "$WPA_CONF" && return 0
+  sed -i '/^mac_addr=/d' "$WPA_CONF"
+  sed -i "1i mac_addr=${want}" "$WPA_CONF"
+}
+
+# A captive portal authorises a MAC ADDRESS, not a person. Randomising on the
+# converge that follows would throw away the login you just completed, so
+# `netmode portal` pins whatever MAC cleared the portal and every converge
+# after it holds that MAC until `netmode mac-new` releases it. With no pin
+# this is the old behaviour exactly: arriving somewhere is when a new identity
+# is wanted, and every converge takes one.
+apply_uplink_mac() {
+  local ifc="$1" p_if p_mac
+  if [[ -f $MAC_PIN ]] && read -r p_if p_mac < "$MAC_PIN" && [[ $p_if == "$ifc" ]]; then
+    # Must happen before reassociate_wifi restarts the supplicant, or the
+    # supplicant re-randomises and the pin is silently discarded.
+    [[ $ifc == "$WIFI" ]] && set_wpa_randomisation 0
+    if set_mac "$ifc" "$p_mac"; then
+      echo "netmode: $ifc MAC held at $p_mac (pinned - a portal authorised it)"
+      return 0
+    fi
+    echo "netmode: WARNING - could not restore pinned MAC $p_mac on $ifc" >&2
+  fi
+  [[ $ifc == "$WIFI" ]] && set_wpa_randomisation 1
+  randomize_mac "$ifc"
+}
+
+pin_uplink_mac() {
+  local ifc="$1" mac
+  mac=$(cat "/sys/class/net/$ifc/address" 2>/dev/null) || return 0
+  echo "$ifc $mac" > "$MAC_PIN"
+  echo "netmode: $ifc MAC $mac pinned - 'netmode mac-new' takes a fresh one"
+}
+
+# Both halves of the MAC story live here. wpa_supplicant's mac_addr=1 DOES work
+# on this hardware (measured), so it, not `ip link set address`, is what
+# normally decides the address - netmode only takes over when a pin is held.
+# The INSTANCE unit owns the association (-c ...-wlan0.conf -i wlan0). On this
+# image the plain wpa_supplicant.service is the D-Bus daemon (-u -s -O) and
+# touching it does not affect wlan0 at all.
+supplicant() {
+  systemctl "$1" "wpa_supplicant@${WIFI}" 2>/dev/null \
+    || systemctl "$1" wpa_supplicant 2>/dev/null || true
+}
+
+# Waits for the supplicant to associate AND take a lease. The MAC is only
+# settled once associated: preassoc_mac_addr=1 randomises during the scan, so
+# sampling earlier reports an address the interface is about to stop wearing.
 reassociate_wifi() {
-  systemctl restart wpa_supplicant 2>/dev/null || true
   local i
   for i in $(seq 1 {{ wifi_reassociate_timeout | default(45) }}); do
     if [[ -n "$(ip -4 -o addr show dev "$WIFI" 2>/dev/null)" ]]; then
@@ -385,6 +467,7 @@ write_avahi_deny() {
 
 VPN_IF={{ vpn_interface }}
 BLOCKY_LISTEN=/etc/blocky/config.d/20-listen.yml
+BLOCKY_UPSTREAM=/etc/blocky/config.d/15-upstream.yml
 
 # A profile is the unit of switching. MODE decides eth0's role, VPN decides
 # whether traffic may leave any way other than the tunnel.
@@ -413,6 +496,187 @@ vpn_stop() {
   ip link show "$VPN_IF" >/dev/null 2>&1 || return 0
   wg-quick down "$VPN_IF" >/dev/null 2>&1 || true
   echo "netmode: $VPN_IF down"
+}
+
+# --- captive portals --------------------------------------------------------
+# Detection is DNS-free by construction, and it has to be: a portal breaks DNS
+# FIRST. blocky's only upstream is DoH on :443, which is exactly what the
+# portal intercepts, so anything needing a name to resolve cannot be the thing
+# that notices the portal. This speaks HTTP/1.1 to a literal anycast address
+# and supplies the Host header itself.
+#
+# 204-with-no-body is the agreed "you are online" answer, and a portal cannot
+# give it: to show you a login page it must answer 200 or redirect.
+#
+#   0  clear      1  portal (PORTAL_URL set)      2  no HTTP path at all
+portal_probe() {
+  PORTAL_URL=""
+  local ip host path out code loc
+  while read -r ip host path; do
+    [[ -n "$ip" ]] || continue
+    out=$(timeout 6 bash -c \
+      'exec 3<>/dev/tcp/$1/80 || exit 1
+       printf "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: netmode\r\n\r\n" "$3" "$2" >&3
+       head -c 4096 <&3' _ "$ip" "$host" "$path" 2>/dev/null) || continue
+    code=$(printf '%s' "$out" | head -1 | awk '{print $2}')
+    [[ $code == 204 ]] && return 0
+    # The Location of the redirect IS the portal's login URL. It is the single
+    # most useful thing to hand back, and the only way to learn it without DNS.
+    loc=$(printf '%s' "$out" | grep -im1 '^location:' | cut -d: -f2- | tr -d '\r' | sed 's/^ *//')
+    PORTAL_URL="${loc:-HTTP $code from $host}"
+    return 1
+  done <<'TARGETS'
+{% for t in portal_probe_targets %}
+{{ t.ip }} {{ t.host }} {{ t.path }}
+{% endfor %}
+TARGETS
+  return 2
+}
+
+portal_check() {
+  local rc=0
+  portal_probe || rc=$?
+  case $rc in
+    0) echo "captive portal: none - this network is clear" ;;
+    1) echo "captive portal: DETECTED"
+       echo "                login page: $PORTAL_URL"
+       echo "                clear it:   netmode portal" ;;
+    *) echo "captive portal: unknown - no HTTP path to any probe target."
+       echo "                that is a dead uplink, not a portal" ;;
+  esac
+  return $rc
+}
+
+# The venue's own resolver, taken from the DHCP lease we already hold. Inside a
+# captive portal this is the ONLY resolver that can answer: the portal is
+# blocking the DoH upstream that would otherwise serve us.
+venue_resolvers() {
+  local ifc="$1" ns r out=""
+  ns=$(dhcpcd -U "$ifc" 2>/dev/null | grep -m1 '^domain_name_servers=' | cut -d= -f2- | tr -d "'\"")
+  for r in $ns; do
+    [[ $r =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && out="$out $r"
+  done
+  # Falling back to the gateway is not a guess: on venue networks the box that
+  # hands out the lease is nearly always the resolver too, and a network that
+  # offers no resolver at all is one whose portal you cannot reach anyway.
+  if [[ -z $out ]]; then
+    r=$(ip -4 route show default dev "$ifc" 2>/dev/null \
+        | awk '{for(i=1;i<=NF;i++) if($i=="via") {print $(i+1); exit}}')
+    [[ -n $r ]] && out=" $r"
+  fi
+  echo "${out# }"
+}
+
+# blocky's upstream half. netmode owns this file for the same reason it owns
+# 20-listen.yml - it is the half that changes - and it writes the WHOLE
+# `upstreams` block every time, so there is never a question about how two
+# config.d fragments merge. Keep in step with blocky-15-upstream.yml.j2.
+write_blocky_upstream() {
+  local portal="${1:-0}" resolvers="${2:-}" r
+  mkdir -p "$(dirname "$BLOCKY_UPSTREAM")"
+  {
+    if [[ $portal == 1 ]]; then
+      echo "# Managed by netmode. CAPTIVE PORTAL MODE - PLAINTEXT DNS."
+      echo "#"
+      echo "# This is the one path the rest of this design forbids. It exists"
+      echo "# because the portal blocks the DoH upstream that would otherwise"
+      echo "# answer, which leaves the venue's own resolver as the only one"
+      echo "# reachable. The portal timer forces a converge, and any converge"
+      echo "# rewrites this file back to DoH - so it cannot be left behind."
+    else
+      echo "# Managed by netmode. Every query leaves this box over DoH."
+    fi
+    echo "upstreams:"
+    echo "  init:"
+    # A travel router boots before it has an uplink; `blocking` would leave it
+    # with no resolver at all until the venue's wifi came up.
+    echo "    strategy: fast"
+    echo "  groups:"
+    echo "    default:"
+    if [[ $portal == 1 ]]; then
+      for r in $resolvers; do echo "      - $r"; done
+    else
+{% for u in blocky_upstreams %}
+      echo "      - {{ u }}"
+{% endfor %}
+    fi
+    echo "  strategy: strict"
+    echo "  timeout: {{ blocky_upstream_timeout }}"
+  } > "$BLOCKY_UPSTREAM"
+}
+
+# The marker carries its own expiry, so a reboot inside the window cannot lose
+# the bound: converge re-arms the timer from it, or clears it if it has passed.
+portal_expiry() { awk -F= '/^expires=/{print $2; exit}' "$PORTAL_STATE" 2>/dev/null; }
+
+# Pure predicate. `status` calls it on every TUI tick, so it must not delete
+# anything - reaping a stale marker is converge's job, below.
+portal_active() {
+  local exp
+  [[ -f $PORTAL_STATE ]] || return 1
+  exp=$(portal_expiry)
+  [[ -n $exp ]] || return 1
+  [[ $(date +%s) -lt $exp ]]
+}
+
+portal_arm_timer() {
+  local secs="$1"
+  systemctl stop netmode-portal.timer 2>/dev/null || true
+  systemctl reset-failed netmode-portal.service 2>/dev/null || true
+  systemd-run --quiet --unit=netmode-portal --on-active="${secs}s" \
+    /usr/local/sbin/netmode portal-expire \
+    || die "could not arm the portal timer; refusing to open the box with no way back"
+}
+
+portal_close() {
+  rm -f "$PORTAL_STATE"
+  systemctl stop netmode-portal.timer 2>/dev/null || true
+  systemctl reset-failed netmode-portal.service 2>/dev/null || true
+}
+
+portal_open() {
+  local profile; profile=$(cat "$STATE" 2>/dev/null) || die "no declared profile at $STATE - run: netmode <profile>"
+  local secs="${PORTAL_SECS:-$PORTAL_TIMEOUT}"
+  case "$secs" in ''|*[!0-9]*) die "--for takes whole seconds, got: $secs" ;; esac
+  [ "$secs" -ge 60 ] || die "--for must be at least 60s, got: $secs"
+
+  # A new venue is a new identity, and the pin is what SURVIVES a venue - so it
+  # goes before the MAC that this portal will authorise is chosen.
+  rm -f "$MAC_PIN"
+  { echo "profile=$profile"
+    echo "opened=$(date -Is)"
+    echo "expires=$(( $(date +%s) + secs ))"
+  } > "$PORTAL_STATE"
+
+  converge
+  pin_uplink_mac "$PORTAL_UPLINK"
+
+  echo ""
+  echo "netmode: CAPTIVE PORTAL MODE - $((secs / 60))m, then back to '$profile' on its own"
+  echo "netmode:   tunnel DOWN, DNS plaintext to the venue, clients limited to :80/:443"
+  echo "netmode:   join the AP, open any http:// page, complete the login"
+  local rc=0
+  portal_probe || rc=$?
+  case $rc in
+    0) echo "netmode:   probe says this network is ALREADY CLEAR - run: netmode $profile" ;;
+    1) echo "netmode:   login page: $PORTAL_URL" ;;
+  esac
+  echo "netmode:   when you are through:  netmode $profile"
+  echo "netmode:   (that keeps the MAC the portal authorised; mac-new drops it)"
+}
+
+# wg-quick "up" only creates the interface - it succeeds against a network that
+# drops every packet it sends. A completed handshake is the only proof the
+# tunnel actually reaches its peer, and a captive portal is the usual reason
+# it does not.
+wg_handshake_ok() {
+  local secs="${1:-20}" i hs
+  for i in $(seq 1 "$secs"); do
+    hs=$(wg show "$VPN_IF" latest-handshakes 2>/dev/null | awk '{print $2; exit}')
+    [[ -n $hs && $hs != 0 ]] && return 0
+    sleep 1
+  done
+  return 1
 }
 
 # Which addresses the resolver answers on. Specific addresses, never 0.0.0.0:
@@ -446,11 +710,25 @@ converge() {
   local profile; profile=$(cat "$STATE" 2>/dev/null) || die "no declared profile at $STATE - run: netmode <profile>"
   local MODE VPN; resolve_profile "$profile"
   local mode="$MODE"
+  local portal=0
+  # A marker whose window has passed is stale - reap it here rather than let a
+  # boot converge re-enter portal mode from it. This is the only place that
+  # deletes it on expiry, so `status` can stay a pure query.
+  if [[ -f $PORTAL_STATE ]] && ! portal_active; then portal_close; fi
+  # Portal mode overrides the profile's VPN, never its mode: {{ eth_if }} keeps
+  # the role it already had, so the LAN does not renumber under its own clients
+  # halfway through a login page.
+  if portal_active; then
+    portal=1; VPN=0
+    local _left=$(( $(portal_expiry) - $(date +%s) ))
+    # The transient timer does not survive a reboot but the marker does, so the
+    # window is re-armed from the recorded expiry - never extended by it.
+    portal_arm_timer "$_left"
+    echo "netmode: CAPTIVE PORTAL MODE - $(( _left / 60 ))m left, then back to '$profile'"
+  fi
   local uplink; [[ $mode == serve ]] && uplink="$WIFI" || uplink="$ETH"
+  PORTAL_UPLINK="$uplink"
 
-  # Tunnel first: the firewall below is generated around where traffic may exit,
-  # so it must be built knowing whether wg0 exists.
-  if [[ $VPN == 1 ]]; then vpn_start; else vpn_stop; fi
   write_blocky_listen "$mode"
   write_avahi_deny "$mode"
 
@@ -458,8 +736,18 @@ converge() {
   # Whichever leg faces the venue gets a fresh identity on every converge -
   # arriving somewhere new is exactly when a new identity is wanted. LAN legs
   # are never touched: a changing MAC there would break client ARP caches.
-  randomize_mac "$uplink"
-  [[ "$uplink" == "$WIFI" ]] && reassociate_wifi
+  # The supplicant must NOT be running while the MAC changes. A live instance
+  # holds its own copy of the config, reacts to the interface bounce, and
+  # re-randomises over whatever was just set - measured on this hardware: the
+  # pin was silently replaced. Stopped across the change, it holds.
+  if [[ "$uplink" == "$WIFI" ]]; then
+    supplicant stop
+    apply_uplink_mac "$uplink"
+    supplicant start
+    reassociate_wifi
+  else
+    apply_uplink_mac "$uplink"
+  fi
 {% endif %}
 
   write_dhcpcd_block "$mode"
@@ -480,6 +768,44 @@ converge() {
   # restart, never reload: a failed unit cannot be reloaded back to life.
   systemctl restart dnsmasq
 
+  # --- the tunnel, and the gate in front of it ------------------------------
+  # This sits AFTER the MAC change, the reassociation and the dhcpcd bounce,
+  # because only now does the uplink actually carry traffic. Probing before
+  # that tested the PREVIOUS venue's association and always came back dead.
+  #
+  # vpn_stop is unconditional so the probe below runs on a bare uplink:
+  # wg-quick installs a default route into $VPN_IF, so with the tunnel up this
+  # box cannot see the venue's portal at all - which is precisely the state we
+  # are trying to diagnose.
+  vpn_stop
+  if [[ $VPN == 1 ]]; then
+    local _rc=0; portal_probe || _rc=$?
+    case $_rc in
+      # Arming the kill switch around a tunnel that can never handshake locks
+      # this box out of the one network it needs in order to log in. That is
+      # the chicken-and-egg that used to cost a second device and a cloned MAC.
+      1) die "a CAPTIVE PORTAL is in the way, so $VPN_IF will never handshake.\n  login page: $PORTAL_URL\n  clear it first:  netmode portal\n  then:            netmode $profile" ;;
+      2) echo "netmode: WARNING - no HTTP path out $uplink at all - converging fail-closed" >&2 ;;
+    esac
+    vpn_start
+    # wg-quick "up" only creates the interface; it succeeds against a network
+    # that drops every packet it sends. A handshake is the only proof the peer
+    # is reachable, and the probe above has already ruled out a portal.
+    wg_handshake_ok 20 \
+      || echo "netmode: WARNING - no $VPN_IF handshake, but the network probed clear - peer or key problem, not a portal" >&2
+  fi
+
+  # Upstreams last: venue_resolvers reads the DHCP lease, and the lease is only
+  # final after the MAC change, the reassociation and the dhcpcd bounce above.
+  if [[ $portal == 1 ]]; then
+    local _vres; _vres=$(venue_resolvers "$uplink")
+    [[ -n $_vres ]] || echo "netmode: WARNING - the venue handed out no resolver; the login page may not load" >&2
+    write_blocky_upstream 1 "$_vres"
+    echo "netmode: DNS is PLAINTEXT to ${_vres:-<none>} while the portal is open"
+  else
+    write_blocky_upstream 0
+  fi
+
   # The listen addresses just changed with the mode and blocky binds them at
   # startup, so without this it keeps answering on the addresses the PREVIOUS
   # mode had - or, switching the other way, never binds the new one at all.
@@ -497,21 +823,68 @@ converge() {
     || echo "netmode: WARNING - blocky is not answering on 127.0.0.1:53" >&2
 
   [[ -n "${ROLLBACK:-}" ]] && schedule_rollback "$ROLLBACK"
-  if ! apply_firewall "$uplink" "$mode" "$VPN"; then
+  if ! apply_firewall "$uplink" "$mode" "$VPN" "$portal"; then
     systemctl stop netmode-rollback.timer 2>/dev/null || true
     die "firewall apply failed; rollback disarmed, previous ruleset left intact"
   fi
   sleep 2
   assert_sane "$mode"
-  echo "netmode: converged to '$profile' (mode=$mode uplink=$uplink egress=$([[ $VPN == 1 ]] && echo "$VPN_IF" || echo "$uplink"))"
+  echo "netmode: converged to '$profile' (mode=$mode uplink=$uplink egress=$([[ $VPN == 1 ]] && echo "$VPN_IF" || echo "$uplink")$([[ $portal == 1 ]] && echo " PORTAL"))"
+}
+
+portal_status_line() {
+  local exp
+  if portal_active; then
+    exp=$(portal_expiry)
+    echo "OPEN - tunnel down, plaintext DNS, web only - closes in $(( (exp - $(date +%s)) / 60 ))m"
+  elif [[ -f $PORTAL_STATE ]]; then
+    # The window has passed but nothing has converged yet, so the ruleset on the
+    # box is still the open one. Saying "closed" here would be a lie.
+    echo "EXPIRED - still open until a converge runs; run: netmode $(cat "$STATE" 2>/dev/null || echo serve)"
+  else
+    echo "closed"
+  fi
+}
+
+mac_status_line() {
+  local ifc="$1" cur p_if p_mac
+  cur=$(cat "/sys/class/net/$ifc/address" 2>/dev/null || echo '?')
+  if [[ -f $MAC_PIN ]] && read -r p_if p_mac < "$MAC_PIN" && [[ $p_if == "$ifc" ]]; then
+    [[ $p_mac == "$cur" ]] && echo "$cur PINNED" || echo "$cur PIN $p_mac NOT APPLIED"
+  else
+    echo "$cur random"
+  fi
+}
+
+upstream_status_line() {
+  [[ -f $BLOCKY_UPSTREAM ]] || { echo "unknown - $BLOCKY_UPSTREAM absent"; return 0; }
+  local ups; ups=$(awk '/^      - /{sub(/^      - /,""); printf "%s ", $0}' "$BLOCKY_UPSTREAM")
+  if grep -q 'CAPTIVE PORTAL MODE' "$BLOCKY_UPSTREAM"; then
+    echo "PLAINTEXT ${ups% } - portal mode"
+  else
+    echo "DoH ${ups% }"
+  fi
 }
 
 status() {
+  # The uplink is derived from the declared profile, not from the routing
+  # table: with the tunnel up the default route names wg0, not the leg it rides.
+  local smode=serve
+  case "$(cat "$STATE" 2>/dev/null)" in
+{% for name, p in netmode_profiles.items() %}
+    {{ name }}) smode={{ p.mode }} ;;
+{% endfor %}
+    uplink|wan) smode=uplink ;;
+  esac
+  local supl; [[ $smode == serve ]] && supl="$WIFI" || supl="$ETH"
   echo "profile       : $(cat "$STATE" 2>/dev/null || echo '<unset>')"
+  echo "portal        : $(portal_status_line)"
   echo "vpn ($VPN_IF)    : $(ip link show "$VPN_IF" >/dev/null 2>&1 && echo UP || echo down)"
   echo "egress        : $(nft list chain inet netmode postrouting 2>/dev/null | grep -oE 'oifname "[a-z0-9]+" masquerade' || echo none)"
   echo "dnsmasq (dhcp): $(systemctl is-active dnsmasq)"
   echo "blocky (dns)  : $(systemctl is-active blocky)"
+  echo "dns upstream  : $(upstream_status_line)"
+  echo "uplink mac    : $(mac_status_line "$supl")"
   echo "output guard  : $(nft list chain inet netmode output 2>/dev/null | grep -oE 'policy (drop|accept)' | head -1 || echo none)"
   echo "hostapd       : $(systemctl is-active hostapd)"
   echo "lan snippet   : $([[ -f $LAN_SNIPPET ]] && echo present || echo absent)"
@@ -522,10 +895,14 @@ status() {
 
 mkdir -p "$STATE_DIR"
 ROLLBACK=""
+PORTAL_SECS=""
+PORTAL_CHECK=""
 cmd="${1:-}"; shift || true
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --rollback) ROLLBACK="${2:?--rollback needs seconds}"; shift 2 ;;
+    --for)      PORTAL_SECS="${2:?--for needs seconds}"; shift 2 ;;
+    --check)    PORTAL_CHECK=1; shift ;;
     *) die "unknown option: $1" ;;
   esac
 done
@@ -535,13 +912,20 @@ done
 # remain as aliases so muscle memory keeps working.
 case "$cmd" in
 {% for name in netmode_profiles.keys() %}
-  {{ name }})  echo {{ name }} > "$STATE"; converge ;;
+  {{ name }})  echo {{ name }} > "$STATE"; portal_close; converge ;;
 {% endfor %}
-  serve|lan)   echo serve  > "$STATE"; converge ;;
-  uplink|wan)  echo uplink > "$STATE"; converge ;;
+  serve|lan)   echo serve  > "$STATE"; portal_close; converge ;;
+  uplink|wan)  echo uplink > "$STATE"; portal_close; converge ;;
+  # Naming a profile is how you LEAVE portal mode. Bare `converge` is not:
+  # that is what boot runs, and a reboot must not silently drop the window.
   converge) converge ;;
+  portal)   if [[ -n $PORTAL_CHECK ]]; then portal_check; else portal_open; fi ;;
+  portal-expire)
+    echo "netmode: portal window expired - restoring '$(cat "$STATE" 2>/dev/null || echo '?')'" >&2
+    portal_close; converge ;;
+  mac-new)  rm -f "$MAC_PIN"; echo "netmode: MAC pin dropped - this converge takes a fresh identity"; converge ;;
   confirm)  cancel_rollback ;;
   rollback-fire) rollback_fire ;;
   status)   status ;;
-  *) die "usage: netmode {{'{'}}{{ netmode_profiles.keys()|join('|') }}|serve|uplink|converge|confirm|status{{'}'}} [--rollback SECS]\n  serve  = eth0 FEEDS the wired net (this is UniFi WAN)\n  uplink = eth0 TAKES an address from the venue" ;;
+  *) die "usage: netmode {{'{'}}{{ netmode_profiles.keys()|join('|') }}|serve|uplink|converge|confirm|status|portal|mac-new{{'}'}}\n              [--rollback SECS] [--for SECS] [--check]\n  serve   = {{ eth_if }} FEEDS the wired net (this is UniFi WAN)\n  uplink  = {{ eth_if }} TAKES an address from the venue\n  portal  = open a bounded hole to clear a captive portal (--check only probes)\n  mac-new = drop the pinned uplink MAC and take a fresh identity" ;;
 esac
