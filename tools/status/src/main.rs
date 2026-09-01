@@ -74,7 +74,7 @@ fn usage() -> ! {
                         [--sudo-pass-file PATH] [--once]\n\
          \n\
          With no --host, tries 10.6.141.1 (eth0 leg) then 10.9.141.1 (AP leg).\n\
-         With no -i, uses ~/.ssh/mce888-pi-deploy if it exists, else your ssh defaults.\n\
+         With no -i, uses your ssh defaults - ssh_config and the agent.\n\
          --once prints one plain-text snapshot and exits (for scripts)."
     );
     std::process::exit(2);
@@ -102,14 +102,6 @@ fn parse_args() -> Opts {
             "--sudo-pass-file" => o.sudo_pass_file = Some(val(&mut args)),
             "--once" => o.once = true,
             _ => usage(),
-        }
-    }
-    if o.identity.is_none() {
-        if let Some(home) = std::env::var_os("HOME") {
-            let key = std::path::Path::new(&home).join(".ssh/mce888-pi-deploy");
-            if key.exists() {
-                o.identity = Some(key.to_string_lossy().into_owned());
-            }
         }
     }
     o
