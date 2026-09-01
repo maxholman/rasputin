@@ -248,6 +248,36 @@
   when: harden_ssh | bool
   notify: reload ssh
 
+# --- status tool -------------------------------------------------------------
+# rasputin-status polls every couple of seconds and runs BatchMode, so it can
+# answer no prompt. Its privileged probes used to arrive as a script piped into
+# `sudo bash -s`, which no sudoers rule can narrow: allowing that is allowing
+# root. A fixed root-owned script can be pinned by path instead.
+#
+# root-owned and not writable by {{ ansible_user }} - the NOPASSWD rule below
+# makes anyone who can edit this file root.
+- name: Install the status facts script
+  ansible.builtin.copy:
+    src: rasputin-facts.sh
+    dest: /usr/local/sbin/rasputin-facts
+    owner: root
+    group: root
+    mode: "0755"
+
+# Scoped to one path with no arguments, so it grants exactly the read-only
+# probes above and nothing else. validate is the guard rail: an unparseable
+# sudoers drop-in takes sudo down for every user on the box.
+- name: Let the status tool read privileged facts without a password
+  ansible.builtin.copy:
+    dest: /etc/sudoers.d/20-rasputin-status
+    owner: root
+    group: root
+    mode: "0440"
+    validate: /usr/sbin/visudo -cf %s
+    content: |
+      # Managed by rasputin.
+      {{ ansible_user }} ALL=(root) NOPASSWD: /usr/local/sbin/rasputin-facts
+
 # --- config ----------------------------------------------------------------
 - name: Create netmode directories
   ansible.builtin.file:
