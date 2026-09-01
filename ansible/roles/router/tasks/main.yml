@@ -78,6 +78,176 @@
     - 099-upstream.conf.orig
   notify: restart dnsmasq
 
+# --- the half of RaspAP that listens ----------------------------------------
+# See purge_raspap_api in defaults for what these are. Masked rather than
+# disabled for the same reason raspapd is: a thing that runs at boot and
+# reconfigures the router must not be able to return by dependency. Nothing
+# depends on them - netmode owns every knob they offer.
+- name: Mask the RaspAP REST API and its network monitor
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: stopped
+    enabled: false
+    masked: true
+  failed_when: false
+  loop:
+    - restapi.service
+    - "raspap-network-activity@{{ wan_wifi_if }}.service"
+  when: purge_raspap_api | bool
+
+# The web UI's tail. php-fpm is the FastCGI backend for the UI that is already
+# disabled and it listens on a unix socket, not a port, so this is surface
+# rather than exposure. It goes because a daemon running for a service that no
+# longer exists is one more thing the next rebuild has to explain.
+- name: Stop the web stack's leftover daemons and timers
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: stopped
+    enabled: false
+  failed_when: false
+  loop:
+    - php8.4-fpm.service
+    - lighttpd-maint.timer
+    - phpsessionclean.timer
+    - openvpn.service   # the tunnel here is wireguard; this never ran
+  when: purge_raspap | bool
+
+# A SECOND set of base chains at the same hooks as inet netmode, reloaded from
+# /etc/nftables.conf at every boot. The filter half is shadowed by netmode's
+# drop policy - a drop at a hook beats an accept in another chain there - but
+# chain routethrough carries a standing `oifname eth0 masquerade` that nothing
+# sanctioned, and in uplink mode eth0 is the venue's leg. The role already
+# empties the iptables equivalent below; it never knew about the nft-native one.
+#
+# Emptied, and deliberately NOT given a `flush ruleset`: nftables.service and
+# netmode-converge have no ordering between them, so a flush here would wipe
+# the live table on whichever boot it happened to run second.
+- name: Stop nftables.conf restoring RaspAP's second table
+  ansible.builtin.copy:
+    dest: /etc/nftables.conf
+    mode: "0644"
+    backup: true
+    content: |
+      #!/usr/sbin/nft -f
+      # Managed by rasputin. The live ruleset is table inet netmode, written by
+      # netmode at every converge and rebuilt at boot. Nothing else claims a
+      # hook here - no flush on purpose, see the role task.
+  when: purge_raspap | bool
+
+# --- mce888 ------------------------------------------------------------------
+# Removed rather than stopped: the image is kept on the controller, so nothing
+# here is the last copy. The named volume is left alone - see purge_mce888.
+- name: Remove the mce888 container and image
+  ansible.builtin.command: "docker {{ item }}"
+  loop:
+    - rm --force mce888-sms
+    - image rm --force mce888-sms:latest
+  failed_when: false
+  changed_when: true
+  when: purge_mce888 | bool
+
+# Masked, not merely stopped. Docker installs its own base chains and a bridge
+# at every start, and those chains are the one part of this box's packet path
+# that netmode does not write - so leaving it able to start leaves a second
+# author of the ruleset.
+- name: Mask Docker
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: stopped
+    enabled: false
+    masked: true
+  failed_when: false
+  loop: [docker.service, docker.socket, containerd.service]
+  when: purge_mce888 | bool
+
+# The mce888 deploy key carried no from= or command= restriction on an account
+# with passwordless sudo, so a key minted to ship a container in another project
+# held full root here. It goes by not being listed, rather than by being matched
+# and deleted - which is the difference between a file that is audited and a
+# file that is patched.
+#
+# The assert is the lockout guard: a typo that renders admin_ssh_keys empty
+# would otherwise write an empty file and take the next connection with it.
+- name: Refuse to write an empty authorized_keys
+  ansible.builtin.assert:
+    that:
+      - admin_ssh_keys | length > 0
+      - admin_ssh_keys | select('match', '^(ssh|ecdsa)-') | list | length == admin_ssh_keys | length
+    fail_msg: "admin_ssh_keys is empty or malformed - refusing to write authorized_keys"
+    quiet: true
+
+# Looped, not joined: Ansible leaves the \n in join('\n') as two literal
+# characters, so every key past the first lands on a line sshd cannot parse.
+- name: Declare who may log in
+  ansible.builtin.copy:
+    dest: "/home/{{ ansible_user }}/.ssh/authorized_keys"
+    owner: "{{ ansible_user }}"
+    mode: "0600"
+    backup: true
+    content: |
+      # Managed by rasputin - declared in admin_ssh_keys. Edits here are lost.
+      {% for key in admin_ssh_keys %}
+      {{ key }}
+      {% endfor %}
+
+- name: Remove the mce888 environment file
+  ansible.builtin.file:
+    path: "/home/{{ ansible_user }}/mce888-sms.env"
+    state: absent
+  when: purge_mce888 | bool
+
+# --- secrets the old stack left readable -------------------------------------
+# RaspAP-era ownership: the wireguard configs are www-data-owned and 0644, so
+# the tunnel's private key is readable by every account on the box. They are
+# also the one thing this role cannot rebuild from the repo - the key exists
+# nowhere else - which makes these permissions the only thing standing over an
+# identity a dead SD card would take with it.
+- name: Find the wireguard configs
+  ansible.builtin.find:
+    paths: "/etc/wireguard"
+    patterns: "*"          # not just *.conf - wg0.conf.bak holds a key too
+    file_type: file        # wg0.conf is a symlink; its target is matched anyway
+  register: _wg_confs
+
+- name: Lock the wireguard configs to root
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    owner: root
+    group: root
+    mode: "0600"
+  loop: "{{ _wg_confs.files }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+# Old copies from when wlan0 was tried as the AP. Both are 0644 and both carry a
+# wpa_passphrase line, so they leak the passphrase that the live hostapd.conf is
+# careful to keep at 0600.
+- name: Remove the hostapd backups carrying the AP passphrase
+  ansible.builtin.file:
+    path: "/etc/hostapd/{{ item }}"
+    state: absent
+  loop:
+    - hostapd.conf.broken-5ghz
+    - hostapd.conf.wlan0-24
+
+# --- admin plane -------------------------------------------------------------
+# Why this is worth closing at all: see harden_ssh in defaults.
+#
+# A drop-in rather than an edit to sshd_config, so an OS upgrade cannot quietly
+# revert it by winning a conffile prompt.
+- name: Require key authentication for SSH
+  ansible.builtin.copy:
+    dest: /etc/ssh/sshd_config.d/10-rasputin.conf
+    mode: "0644"
+    validate: /usr/sbin/sshd -t -f %s
+    content: |
+      # Managed by rasputin. Keys only - see the role for why.
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      PermitRootLogin no
+  when: harden_ssh | bool
+  notify: reload ssh
+
 # --- config ----------------------------------------------------------------
 - name: Create netmode directories
   ansible.builtin.file:

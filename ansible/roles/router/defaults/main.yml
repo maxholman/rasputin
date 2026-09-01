@@ -43,6 +43,43 @@ converge_on_deploy: true
 # route around the blocklist and the DoH upstream. Nothing here depends on it.
 purge_raspap: true
 
+# Separate from purge_raspap because it removes a different kind of thing: the
+# half of RaspAP that listens. restapi.service is a uvicorn app on 0.0.0.0:8081
+# whose endpoints shell out, read /etc/wireguard and return the AP passphrase in
+# plaintext. Its whole gate is one static header key, and the code falls back to
+# the literal string "insecure" when the env var is missing.
+purge_raspap_api: true
+
+# mce888 arrived with the SD card image, not with this router - the card is a
+# clone of that project's box. Removing it takes Docker with it; nothing else
+# here uses containers. The named volume is deliberately NOT removed: it is the
+# workload's only state, and it costs nothing to leave until the rebuild.
+purge_mce888: true
+
+# SSH. Key auth is already how every path into this box works, so the password
+# path is a second way in that nothing depends on. It matters more than it looks
+# because sshd binds 0.0.0.0 and the input chain is the ONLY thing keeping :22
+# off the venue - and `netmode rollback-fire` deletes that table wholesale.
+harden_ssh: true
+
+# Exactly who may log in. The file is written WHOLE, not appended to: an
+# authorized_keys that nothing declares is how a deploy key issued for another
+# project held root on this box for months, and no run would ever have noticed.
+# Public material, so it belongs in the repo rather than the vault.
+#
+# One key per origin - person plus machine - never per destination. The point is
+# being able to revoke one laptop without touching anyone else, and the comment
+# field is the only label this file has, so make it say whose and from where.
+#
+# Add before you remove, and prove the new key on a connection that is not
+# multiplexed (ssh -o ControlPath=none) - ControlMaster will happily reuse an
+# authenticated socket and tell you a key works when it has never been offered.
+admin_ssh_keys:
+  # Max's workstation, and currently the only way in. Passphrase-protected,
+  # which costs nothing: nothing on the box schedules a converge, so every run
+  # is already someone at a terminal typing a become password anyway.
+  - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILXEmtGE22ssdQJgHMyoE3yMxQ5ttm7+Han/BOYRU4nu mholman@ws7"
+
 # Privacy on venue networks. Randomises wlan0's MAC per-ESS and eth0's MAC when
 # eth0 is the uplink. Turn off only if some network you rely on does MAC-based
 # auth or hands you a MAC reservation you need.

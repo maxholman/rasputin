@@ -31,7 +31,7 @@ invite exactly the wrong command.
 
 `lan` and `wan` still work as aliases for `serve` and `uplink`.
 
-## Use
+## Usage
 
     netmode serve      # eth0 provides a WAN to UniFi (default)
     netmode uplink     # eth0 consumes a WAN from the venue
@@ -44,6 +44,11 @@ invite exactly the wrong command.
 converge path, so there is no drift between "what I asked for" and "what boots".
 
 ## Deploy
+
+Ansible authenticates as `admin_ssh_keys`, a passphrase-protected key, and it
+cannot prompt for a passphrase itself - it needs an agent holding the key or it
+fails at the connection having done nothing. On ws7 the desktop keyring loads it
+already; anywhere else, `ssh-add ~/.ssh/id_ed25519` first.
 
 ### First run, or any run on a box you cannot physically reach
 

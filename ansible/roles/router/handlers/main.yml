@@ -68,3 +68,13 @@
   retries: 10
   delay: 3
   changed_when: false
+
+# Validate the WHOLE config, not just the fragment the task already checked: a
+# drop-in can parse alone and still contradict sshd_config. Guard rail #1, the
+# same shape as dnsmasq.
+#
+# reload, not restart: established sessions survive it, so a mistake here still
+# leaves you the window in which to fix it.
+- name: reload ssh
+  ansible.builtin.shell: sshd -t && systemctl reload ssh
+  changed_when: true
