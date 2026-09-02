@@ -27,10 +27,10 @@
   ansible.builtin.systemd: daemon_reload=true
 
 # On a first deploy leave this OFF (-e converge_on_deploy=false) and run
-# `netmode serve --rollback 300` by hand, so an untested firewall cannot
+# `rasputin serve --rollback 300` by hand, so an untested firewall cannot
 # strand you. Converging from a handler gives you no rollback window.
-- name: converge netmode
-  ansible.builtin.command: /usr/local/sbin/netmode converge
+- name: converge rasputin
+  ansible.builtin.command: /usr/local/sbin/rasputin converge
   when: converge_on_deploy | default(true) | bool
   changed_when: true
 

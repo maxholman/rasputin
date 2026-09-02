@@ -4,8 +4,8 @@ Replaces RaspAP. Two layers, deliberately separated:
 
 | Layer | Owns | Changes | Tool |
 |---|---|---|---|
-| **IaC** | what the box *is* — packages, hostapd, dnsmasq base, `netmode` itself | rarely | Ansible |
-| **Runtime** | what role `eth0` plays *right now* | per venue | `netmode` |
+| **IaC** | what the box *is* — packages, hostapd, dnsmasq base, `rasputin` itself | rarely | Ansible |
+| **Runtime** | what role `eth0` plays *right now* | per venue | `rasputin` |
 
 Runtime mode is not expressed as a git commit, because switching modes must work
 when you have no network — which is exactly when you need to switch.
@@ -26,21 +26,21 @@ invite exactly the wrong command.
 
 | | `eth0` | uplink | serving |
 |---|---|---|---|
-| `netmode serve` | **provides** a WAN interface to another client (UniFi) | `wlan0` → hotspot | `eth0` (10.6.141.1) + `wlan1` AP (10.9.141.1) |
-| `netmode uplink` | **connects to** a WAN (venue ethernet, DHCP) | `eth0` | `wlan1` AP only |
+| `rasputin serve` | **provides** a WAN interface to another client (UniFi) | `wlan0` → hotspot | `eth0` (10.6.141.1) + `wlan1` AP (10.9.141.1) |
+| `rasputin uplink` | **connects to** a WAN (venue ethernet, DHCP) | `eth0` | `wlan1` AP only |
 
 `lan` and `wan` still work as aliases for `serve` and `uplink`.
 
 ## Usage
 
-    netmode serve      # eth0 provides a WAN to UniFi (default)
-    netmode uplink     # eth0 consumes a WAN from the venue
-    netmode status     # declared vs actual
-    netmode converge   # re-apply declared mode (runs at boot)
-    netmode portal     # open a bounded hole to clear a captive portal
-    netmode mac-new    # drop the pinned uplink MAC, take a fresh identity
+    rasputin serve      # eth0 provides a WAN to UniFi (default)
+    rasputin uplink     # eth0 consumes a WAN from the venue
+    rasputin status     # declared vs actual
+    rasputin converge   # re-apply declared mode (runs at boot)
+    rasputin portal     # open a bounded hole to clear a captive portal
+    rasputin mac-new    # drop the pinned uplink MAC, take a fresh identity
 
-`serve`/`uplink` write `/etc/netmode/mode`, then converge. Boot runs the same
+`serve`/`uplink` write `/etc/rasputin/mode`, then converge. Boot runs the same
 converge path, so there is no drift between "what I asked for" and "what boots".
 
 ## Deploy
@@ -57,14 +57,14 @@ firewall up behind a rollback window:
 
     cd ansible
 
-    # 1. files only - netmode, dnsmasq snippets, boot unit. Nothing applied.
+    # 1. files only - rasputin, dnsmasq snippets, boot unit. Nothing applied.
     ansible-playbook site.yml --ask-become-pass -e converge_on_deploy=false
 
     # 2. apply mode + firewall, auto-reverting in 5 minutes
-    ssh -t pi@10.6.141.1 'sudo netmode serve --rollback 300'
+    ssh -t pi@10.6.141.1 'sudo rasputin serve --rollback 300'
 
     # 3. from a NEW terminal - prove you can still get in, then keep it
-    ssh -t pi@10.6.141.1 'sudo netmode confirm'
+    ssh -t pi@10.6.141.1 'sudo rasputin confirm'
 
 Step 3 must be a **new** session. `ct state established` keeps an existing
 connection alive straight through a broken ruleset, so confirming from the
@@ -100,11 +100,11 @@ blocklist and the DoH upstream in one step. They are removed too.
   every boot, and its job includes `Disabling systemd-networkd` — it would
   silently undo the networkd migration on the next reboot.
 - **`lighttpd` is stopped and disabled.** It was listening on `0.0.0.0:80`.
-  netmode's input chain never accepted `:80` on any interface, so it was not
+  rasputin's input chain never accepted `:80` on any interface, so it was not
   reachable off-box, but it is the process that writes the fragments above.
 - **`/etc/sudoers.d/090_raspap` is removed.** It granted `www-data` passwordless
   root to `cat` `wpa_supplicant.conf` (every venue PSK), overwrite
-  `hostapd.conf` (the AP passphrase) and `dhcpcd.conf` (what netmode rewrites),
+  `hostapd.conf` (the AP passphrase) and `dhcpcd.conf` (what rasputin rewrites),
   install `/etc/dnsmasq.d/090_*.conf`, and `reboot`. Because `/etc/raspap` is
   `www-data`-owned, and rename permission comes from the parent directory,
   `www-data` could also swap the root-owned `hostapd/` subdirectory and have
@@ -126,12 +126,12 @@ your AP keeps its current config and clients. Vault it to manage the AP:
 
 ### Expect during a converge
 
-`netmode` restarts `dhcpcd` for `eth0`, which briefly bounces the wired link —
+`rasputin` restarts `dhcpcd` for `eth0`, which briefly bounces the wired link —
 and with it the WAN of anything downstream. Harmless, but not silent.
 
 ## Firewall
 
-nftables, one table `inet netmode`, regenerated on every mode switch and
+nftables, one table `inet rasputin`, regenerated on every mode switch and
 validated with `nft -c` before it is ever loaded.
 
     input    policy drop  - established/related, loopback, some ICMP,
@@ -189,14 +189,14 @@ are packets we *send*; the output chain only clamps down when a tunnel is up.
 
 `deny-interfaces` is set to whichever leg faces the venue: `wlan0` always (a
 hardware invariant), plus `eth0` in `uplink` mode. `.local` keeps working on
-the AP; the venue hears nothing. netmode rewrites it per mode.
+the AP; the venue hears nothing. rasputin rewrites it per mode.
 
 ### Don't lock yourself out
 
 Tightening this remotely can strand you at a conference. Use the rollback window:
 
-    netmode serve --rollback 300    # firewall reverts in 5 min unless confirmed
-    netmode confirm               # cancel the revert, keep the ruleset
+    rasputin serve --rollback 300    # firewall reverts in 5 min unless confirmed
+    rasputin confirm               # cancel the revert, keep the ruleset
 
 Existing SSH sessions survive a bad ruleset (the `ct state established` rule is
 matched first) — it's the *next* connection that would fail. Confirm from a
@@ -223,16 +223,16 @@ matched first) — it's the *next* connection that would fail. Confirm from a
 - The box resolves through blocky too — `/etc/resolv.conf` is pinned to
   `127.0.0.1`, and `DNS =` is stripped from `wg0.conf` so wg-quick cannot
   point it at Proton behind blocky's back.
-- The **upstream half lives in `15-upstream.yml`, which netmode owns**, not in
+- The **upstream half lives in `15-upstream.yml`, which rasputin owns**, not in
   the Ansible-written base. It is the half that changes: portal mode replaces
   the DoH endpoints with the venue's resolver, and writing the whole
   `upstreams` block from one place means there is never a question about how
   two `config.d` fragments merge. Ansible writes a DoH baseline so a
   `converge_on_deploy=false` deploy still leaves blocky an upstream at all.
 - Listen addresses are **specific, never `0.0.0.0`**. The input chain already
-  refuses `:53` from the uplink, but `netmode rollback-fire` deletes that whole
+  refuses `:53` from the uplink, but `rasputin rollback-fire` deletes that whole
   table — a wildcard bind would turn the lockout insurance into an open
-  resolver on the venue's wifi. `netmode` rewrites `20-listen.yml` per mode.
+  resolver on the venue's wifi. `rasputin` rewrites `20-listen.yml` per mode.
 
 **Known loss:** DHCP lease names no longer resolve. The resolver that knows the
 leases is no longer the resolver clients ask.
@@ -266,7 +266,7 @@ Both certs are long-lived on purpose. This box cannot reach a CA from a hotel,
 and a DoH listener whose certificate expired mid-trip is a router with no DNS.
 
 Opening the listener is **two** changes, not one: binding the port and opening
-it in the input chain. netmode adds `tcp dport 443` for LAN legs only when the
+it in the input chain. rasputin adds `tcp dport 443` for LAN legs only when the
 cert vars are defined. Without that rule the port is bound but every client
 sees a dead connection — which is exactly how this first failed.
 
@@ -292,17 +292,17 @@ tunnel destroyed by `ip link del wg0`:
 
 To re-run it, arm the auto-revert first — this drops all client traffic:
 
-    sudo systemd-run --unit=netmode-safety --on-active=600 /usr/local/sbin/netmode home
-    sudo systemd-run --unit=netmode-apply --collect /usr/local/sbin/netmode hotel-wifi
-    netmode status                      # expect: output guard : policy drop
+    sudo systemd-run --unit=rasputin-safety --on-active=600 /usr/local/sbin/rasputin home
+    sudo systemd-run --unit=rasputin-apply --collect /usr/local/sbin/rasputin hotel-wifi
+    rasputin status                      # expect: output guard : policy drop
 
     # instrument the drop path, then kill the tunnel
-    sudo nft add rule inet netmode output oifname \"wlan0\" counter comment \"leaktest\"
+    sudo nft add rule inet rasputin output oifname \"wlan0\" counter comment \"leaktest\"
     sudo ip link del wg0
     sudo systemctl restart blocky       # force FRESH upstream connections
-    sudo nft list chain inet netmode output | grep leaktest
+    sudo nft list chain inet rasputin output | grep leaktest
 
-    sudo /usr/local/sbin/netmode home   # converge also wipes the counter rule
+    sudo /usr/local/sbin/rasputin home   # converge also wipes the counter rule
 
 **`blocky healthcheck` still returns OK with the tunnel dead** — it only proves
 blocky is listening on `127.0.0.1:53`, not that it can resolve anything. Use an
@@ -325,7 +325,7 @@ Two halves, and the second one is new:
   There is no bootstrap deadlock: the WireGuard peer is a literal IP, so the
   tunnel needs neither DNS nor a correct clock. If the peer endpoint cannot be
   read the chain **fails open with a loud warning** rather than stranding the
-  box — `netmode status` reports whether it is armed.
+  box — `rasputin status` reports whether it is armed.
 
 ## Captive portals
 
@@ -341,13 +341,13 @@ this box is worth stating precisely, because it was never the firewall:
   tunnel that had never handshook, and the box lost the one network it needed
   in order to log in.
 
-`netmode portal` opens a hole big enough to log in and no bigger, and closes it
+`rasputin portal` opens a hole big enough to log in and no bigger, and closes it
 on a timer whether or not you remember to:
 
-    netmode portal            # open it - 15 minutes by default
-    netmode portal --check    # probe only, change nothing
-    netmode portal --for 600  # a shorter window
-    netmode hotel-wifi        # done - back to the tunnel, keeping the MAC
+    rasputin portal            # open it - 15 minutes by default
+    rasputin portal --check    # probe only, change nothing
+    rasputin portal --for 600  # a shorter window
+    rasputin hotel-wifi        # done - back to the tunnel, keeping the MAC
 
 While the window is open:
 
@@ -367,16 +367,16 @@ This is the one place the "every query leaves over DoH" rule is broken, and it
 is broken deliberately, because the alternative is a router that cannot be used
 at a hotel. Three things bound it:
 
-- it is written to `/etc/blocky/config.d/15-upstream.yml`, a file **netmode
+- it is written to `/etc/blocky/config.d/15-upstream.yml`, a file **rasputin
   rewrites on every converge** — so a converge from any cause restores DoH;
 - a transient systemd timer forces exactly such a converge when the window
   expires. The marker carries its own expiry, so a reboot mid-portal **re-arms
   the timer from the recorded expiry** rather than losing the bound or
   extending it;
-- `netmode status` and the status viewer both report the upstream **in red**
+- `rasputin status` and the status viewer both report the upstream **in red**
   for as long as it is plaintext.
 
-Naming a profile (`netmode hotel-wifi`) leaves portal mode. Bare `netmode
+Naming a profile (`rasputin hotel-wifi`) leaves portal mode. Bare `rasputin
 converge` does not — that is what boot runs, and a reboot must not silently
 drop a window you are still inside.
 
@@ -407,14 +407,14 @@ uplink MAC every time — so the converge that *followed* a successful login use
 to throw that login away, which is what made the old cloned-MAC workaround
 necessary.
 
-`netmode portal` pins whatever MAC cleared the portal, and every converge after
-it holds that MAC. Arriving somewhere new still gets a fresh identity: `netmode
+`rasputin portal` pins whatever MAC cleared the portal, and every converge after
+it holds that MAC. Arriving somewhere new still gets a fresh identity: `rasputin
 portal` drops the old pin *before* choosing the MAC the venue will authorise.
 Release it deliberately when you leave:
 
-    netmode mac-new           # drop the pin, fresh identity, converge
+    rasputin mac-new           # drop the pin, fresh identity, converge
 
-`netmode status` shows `PINNED`, or `PIN ... NOT APPLIED` if a pin exists but
+`rasputin status` shows `PINNED`, or `PIN ... NOT APPLIED` if a pin exists but
 the interface is not wearing it.
 
 Holding a MAC on `wlan0` took three corrections, all found on hardware and all
@@ -422,9 +422,9 @@ invisible in a dry run:
 
 - **`wpa_supplicant`, not `ip link`, decides the address.** `mac_addr=1` in
   `wpa_supplicant.conf` randomises per ESS at association and overwrites
-  whatever was set directly. Measured: netmode set `02:c7:fc:e9:3d:56` and the
+  whatever was set directly. Measured: rasputin set `02:c7:fc:e9:3d:56` and the
   interface came up wearing `8a:db:56:49:f7:6f`. The old comment claiming
-  brcmfmac ignores `mac_addr=1` was simply wrong. netmode now flips it to
+  brcmfmac ignores `mac_addr=1` was simply wrong. rasputin now flips it to
   `mac_addr=0` while a pin is held, and back to `1` when the pin is dropped.
 - **The supplicant must be stopped across the change.** Setting the MAC
   underneath a live instance lets it react to the interface bounce and
@@ -438,10 +438,10 @@ invisible in a dry run:
   all. `reassociate_wifi` had been restarting the wrong one for its whole life
   — the interface bounce was doing the work by accident.
 
-Ansible and netmode both write `mac_addr`, so the role's `lineinfile` carries a
+Ansible and rasputin both write `mac_addr`, so the role's `lineinfile` carries a
 `regexp`. Without it, a deploy while a pin is held **appends** a second
 `mac_addr=` line rather than replacing the first, and the file becomes
-ambiguous about which wins. netmode collapses duplicates on every converge.
+ambiguous about which wins. rasputin collapses duplicates on every converge.
 
 ### Converge no longer walks into the trap
 
@@ -527,7 +527,7 @@ is written anywhere, and **no counters are added to the ruleset the kill switch
 lives in**. `--once` has no previous sample to diff against, so it prints
 totals and a `—` for the rates.
 
-It judges state against the declared profile (`vpn:` in `netmode_profiles`).
+It judges state against the declared profile (`vpn:` in `rasputin_profiles`).
 A green ✓ marks only a promised protection verified present (wg0 up, guard
 drop, on a `vpn: true` profile); a red ✗ marks a mismatch either way; an
 expected-down state renders neutral ("down · no VPN in this profile").
@@ -543,7 +543,7 @@ they are stated loudly rather than quietly. Needs sudo on the Pi; it prompts, or
 1. **Validate before restart.** Handlers run `dnsmasq --test` first. RaspAP wrote
    an invalid fragment, dnsmasq died, and its only recovery action was `reload` —
    which cannot revive a failed unit, so it threw a PHP stack trace forever.
-2. **No default route out a LAN interface.** `netmode` asserts this after every
+2. **No default route out a LAN interface.** `rasputin` asserts this after every
    converge and refuses to finish otherwise. RaspAP wrote `static routers=10.6.141.1`
    on `eth0` — a gateway pointing at the box itself — which black-holed every
    forwarded packet while the WAN was perfectly healthy.

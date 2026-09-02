@@ -3,12 +3,12 @@
 # still leaves blocky an upstream at all.
 #
 # It lives here rather than in 10-base.yml because it is the half that CHANGES:
-# `netmode portal` replaces the DoH endpoints below with the venue's own
+# `rasputin portal` replaces the DoH endpoints below with the venue's own
 # resolver, in plaintext, for as long as a captive portal is being cleared.
-# netmode writes the whole `upstreams` block from one place so there is never a
+# rasputin writes the whole `upstreams` block from one place so there is never a
 # question about how two config.d fragments merge.
 #
-# Keep this generator in step with write_blocky_upstream() in netmode.
+# Keep this generator in step with write_blocky_upstream() in rasputin.
 upstreams:
   init:
     # `fast` = start even when no upstream answers yet. A travel router boots

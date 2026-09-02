@@ -35,7 +35,7 @@
 
 # The sudoers drop-in outlives the daemon and is the real prize: it grants
 # www-data passwordless root to read wpa_supplicant.conf (the venue PSKs), to
-# overwrite hostapd.conf (the AP passphrase) and dhcpcd.conf (what netmode
+# overwrite hostapd.conf (the AP passphrase) and dhcpcd.conf (what rasputin
 # rewrites), and to drop new /etc/dnsmasq.d/090_*.conf fragments - re-entry
 # around both the blocklist and the DoH upstream. Removing a file cannot make
 # sudoers unparseable, so this needs no validate step.
@@ -48,7 +48,7 @@
 # raspapd's boot job was, undocumented, the only thing starting wpa_supplicant
 # on wlan0. The first reboot after masking it came up with the AP beaconing
 # and a dead WAN - the whole house lost internet. The instance unit is the
-# boot-time owner now; netmode's MAC-randomise/reassociate flow needs a
+# boot-time owner now; rasputin's MAC-randomise/reassociate flow needs a
 # running supplicant and provides nothing of its own.
 - name: Link the wlan0 supplicant config for the instance unit
   ansible.builtin.file:
@@ -86,7 +86,7 @@
 # See purge_raspap_api in defaults for what these are. Masked rather than
 # disabled for the same reason raspapd is: a thing that runs at boot and
 # reconfigures the router must not be able to return by dependency. Nothing
-# depends on them - netmode owns every knob they offer.
+# depends on them - rasputin owns every knob they offer.
 #
 # Skipped once the unit files are gone, for the reason given at raspapd above.
 - name: Mask the RaspAP REST API and its network monitor
@@ -118,15 +118,15 @@
     - openvpn.service   # the tunnel here is wireguard; this never ran
   when: purge_raspap | bool
 
-# A SECOND set of base chains at the same hooks as inet netmode, reloaded from
-# /etc/nftables.conf at every boot. The filter half is shadowed by netmode's
+# A SECOND set of base chains at the same hooks as inet rasputin, reloaded from
+# /etc/nftables.conf at every boot. The filter half is shadowed by rasputin's
 # drop policy - a drop at a hook beats an accept in another chain there - but
 # chain routethrough carries a standing `oifname eth0 masquerade` that nothing
 # sanctioned, and in uplink mode eth0 is the venue's leg. The role already
 # empties the iptables equivalent below; it never knew about the nft-native one.
 #
 # Emptied, and deliberately NOT given a `flush ruleset`: nftables.service and
-# netmode-converge have no ordering between them, so a flush here would wipe
+# rasputin-converge have no ordering between them, so a flush here would wipe
 # the live table on whichever boot it happened to run second.
 - name: Stop nftables.conf restoring RaspAP's second table
   ansible.builtin.copy:
@@ -135,8 +135,8 @@
     backup: true
     content: |
       #!/usr/sbin/nft -f
-      # Managed by rasputin. The live ruleset is table inet netmode, written by
-      # netmode at every converge and rebuilt at boot. Nothing else claims a
+      # Managed by rasputin. The live ruleset is table inet rasputin, written by
+      # rasputin at every converge and rebuilt at boot. Nothing else claims a
       # hook here - no flush on purpose, see the role task.
   when: purge_raspap | bool
 
@@ -238,7 +238,7 @@
 
 # --- the last author of table ip nat ----------------------------------------
 # See purge_iptables_persistent. The live table survives until the next boot -
-# nothing here flushes it, because a flush races netmode for the ruleset. It
+# nothing here flushes it, because a flush races rasputin for the ruleset. It
 # goes by not being restored, which is also what proves this worked.
 - name: Remove the iptables persistence layer
   ansible.builtin.apt:
@@ -306,7 +306,7 @@
 
 # --- back to basics ----------------------------------------------------------
 # See strip_to_basics. Everything here arrived with the SD card image and none
-# of it has a job on a router. avahi is deliberately NOT in the list: netmode
+# of it has a job on a router. avahi is deliberately NOT in the list: rasputin
 # references it six times, silencing it per-interface, so removing it would
 # break the converge.
 - name: Remove what the image brought and this router does not use
@@ -396,7 +396,7 @@
 
 # Masked, not merely stopped. Docker installs its own base chains and a bridge
 # at every start, and those chains are the one part of this box's packet path
-# that netmode does not write - so leaving it able to start leaves a second
+# that rasputin does not write - so leaving it able to start leaves a second
 # author of the ruleset.
 - name: Mask Docker
   ansible.builtin.systemd:
@@ -587,23 +587,38 @@
       {{ admin_user }} ALL=(root) NOPASSWD: /usr/local/sbin/rasputin-facts
 
 # --- config ----------------------------------------------------------------
-- name: Create netmode directories
+- name: Create rasputin directories
   ansible.builtin.file:
     path: "{{ item }}"
     state: directory
     mode: "0755"
   loop:
-    - /usr/local/share/netmode
-    - /etc/netmode
+    - /usr/local/share/rasputin
+    - /etc/rasputin
+
+# --- the netmode rename -------------------------------------------------------
+# The declared profile lived in /etc/netmode/mode. It has to move BEFORE the
+# read below, not after: a missing file falls back to default_mode, which would
+# silently turn a declared 'home' into the raw seed and throw away the profile
+# name. force: false so it never overwrites a mode already declared under the
+# new path.
+- name: Carry the declared mode across from the old name
+  ansible.builtin.copy:
+    src: /etc/netmode/mode
+    dest: /etc/rasputin/mode
+    remote_src: true
+    force: false
+    mode: "0644"
+  failed_when: false
 
 # default_mode is only a SEED (written once, force:false). The authoritative
-# mode lives in /etc/netmode/mode and diverges the moment you run `netmode
+# mode lives in /etc/rasputin/mode and diverges the moment you run `rasputin
 # uplink`. Gating config on the seed meant a routine deploy at a hotel could
 # install a DHCP server on the VENUE's ethernet - a rogue DHCP server on
 # someone else's LAN, permanent when converge_on_deploy=false.
 - name: Read the declared mode
   ansible.builtin.slurp:
-    src: /etc/netmode/mode
+    src: /etc/rasputin/mode
   register: _mode_file
   failed_when: false
   changed_when: false
@@ -612,14 +627,14 @@
   ansible.builtin.set_fact:
     _declared: "{{ (_mode_file.content | b64decode | trim) if (_mode_file.content is defined) else default_mode }}"
 
-# /etc/netmode/mode holds a PROFILE name now, not a raw mode. Comparing it
+# /etc/rasputin/mode holds a PROFILE name now, not a raw mode. Comparing it
 # directly against 'serve' meant the profile 'home' - which IS serve - looked
 # like an uplink, and the eth0 DHCP config was deleted out from under a
 # downstream network that depends on it. Resolve through the same profile map
-# netmode uses, so the two can never disagree.
+# rasputin uses, so the two can never disagree.
 - name: Resolve the profile to a mode
   ansible.builtin.set_fact:
-    effective_mode: "{{ netmode_profiles[_declared].mode if (_declared in netmode_profiles) else _declared }}"
+    effective_mode: "{{ rasputin_profiles[_declared].mode if (_declared in rasputin_profiles) else _declared }}"
 
 - name: Show which mode config is being applied for
   ansible.builtin.debug:
@@ -639,21 +654,21 @@
     mode: "0644"
   notify: restart dnsmasq
 
-# Staged, not installed: netmode installs/removes it per mode.
+# Staged, not installed: rasputin installs/removes it per mode.
 - name: Stage the eth0-LAN snippet
   ansible.builtin.template:
     src: 30-eth0-lan.conf.j2
-    dest: /usr/local/share/netmode/30-eth0-lan.conf
+    dest: /usr/local/share/rasputin/30-eth0-lan.conf
     mode: "0644"
-  notify: converge netmode
+  notify: converge rasputin
 
 # Skipped unless ap_passphrase is vaulted. Without this guard the run aborts on
 # an undefined variable - or worse, renders an empty passphrase and drops every
 # client currently associated to the AP.
 # Without this, a deploy with converge_on_deploy=false deletes RaspAP's
-# 090_eth0.conf and installs nothing in its place, because only `netmode
+# 090_eth0.conf and installs nothing in its place, because only `rasputin
 # converge` installs the snippet. dnsmasq would then restart with no DHCP on
-# eth0 and every downstream WAN would lose its lease. netmode still owns this
+# eth0 and every downstream WAN would lose its lease. rasputin still owns this
 # file afterwards - it removes it when switching to uplink mode.
 - name: Install the eth0-LAN snippet when serving
   ansible.builtin.template:
@@ -700,7 +715,7 @@
     mode: "0644"
     backup: true
     content: |
-      # Managed by rasputin. NAT is owned by nftables (table inet netmode).
+      # Managed by rasputin. NAT is owned by nftables (table inet rasputin).
       *nat
       :PREROUTING ACCEPT [0:0]
       :INPUT ACCEPT [0:0]
@@ -713,9 +728,9 @@
 # scanning - otherwise the real MAC is broadcast before you ever associate.
 #
 # The regexp is load-bearing. Without it lineinfile matches the whole literal,
-# so when netmode has set mac_addr=0 to hold a captive-portal pin this APPENDS
+# so when rasputin has set mac_addr=0 to hold a captive-portal pin this APPENDS
 # a second mac_addr= line instead of replacing it, and the file carries both.
-# netmode re-asserts the pin on the converge at the end of a deploy, so a run
+# rasputin re-asserts the pin on the converge at the end of a deploy, so a run
 # during a pinned session heals itself.
 - name: Randomise the wifi client MAC per network
   ansible.builtin.lineinfile:
@@ -755,7 +770,7 @@
     replace: '#duid  # rasputin: stable across MAC changes, defeats randomisation'
 
 # --- DoH certificate ---------------------------------------------------------
-# Must come before netmode is templated: netmode generates blocky's listen
+# Must come before rasputin is templated: rasputin generates blocky's listen
 # file, and whether that file has an https stanza depends on these two facts.
 
 - name: Look for the DoH certificate on the controller
@@ -780,7 +795,7 @@
     msg: "No cert at {{ blocky_doh_local_dir }} - DoH listener stays off, plain DNS only."
   when: blocky_doh_cert is not defined
 
-# Baseline for a deploy that does not converge; netmode rewrites this per mode.
+# Baseline for a deploy that does not converge; rasputin rewrites this per mode.
 # See write_avahi_deny() for why: these are packets we send, so no inbound
 # firewall rule can stop them reaching the venue.
 - name: Stop avahi announcing this box to the venue
@@ -801,16 +816,16 @@
   when: _avahi.changed | default(false)
   failed_when: false
 
-- name: Install netmode
+- name: Install rasputin
   ansible.builtin.template:
-    src: netmode.j2
-    dest: /usr/local/sbin/netmode
+    src: rasputin.j2
+    dest: /usr/local/sbin/rasputin
     mode: "0755"
-  notify: converge netmode
+  notify: converge rasputin
 
 - name: Converge-on-boot unit
   ansible.builtin.copy:
-    dest: /etc/systemd/system/netmode-converge.service
+    dest: /etc/systemd/system/rasputin-converge.service
     mode: "0644"
     content: |
       [Unit]
@@ -823,14 +838,44 @@
       [Service]
       Type=oneshot
       RemainAfterExit=yes
-      ExecStart=/usr/local/sbin/netmode converge
+      ExecStart=/usr/local/sbin/rasputin converge
       [Install]
       WantedBy=multi-user.target
   notify: reload systemd
 
+# The enable symlink goes with the unit file. Removing the unit alone leaves a
+# .wants link pointing at nothing, and boot still tries to pull it in - the
+# exact failure this repo hit purging RaspAP.
+- name: Remove the artefacts of the old name
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /usr/local/sbin/netmode
+    - /usr/local/share/netmode
+    - /etc/netmode
+    - /etc/systemd/system/netmode-converge.service
+    - /etc/systemd/system/multi-user.target.wants/netmode-converge.service
+  register: _old_name
+  notify: reload systemd
+
+# Only once the new table is actually up. Deleting the old one first would
+# leave the box with no ruleset at all until the next converge; deleting it
+# after means the two coexist for a moment, which is the safer half-second.
+# If the new table is not up yet the reboot handles it - nftables.conf declares
+# no tables, so nothing recreates inet netmode.
+- name: Drop the pre-rename firewall table
+  ansible.builtin.shell:
+    cmd: |
+      nft list table inet rasputin >/dev/null 2>&1 || exit 0
+      nft list table inet netmode  >/dev/null 2>&1 || exit 0
+      nft delete table inet netmode && echo removed
+  register: _old_table
+  changed_when: "'removed' in _old_table.stdout"
+
 - name: Seed the declared mode if unset
   ansible.builtin.copy:
-    dest: /etc/netmode/mode
+    dest: /etc/rasputin/mode
     content: "{{ default_mode }}\n"
     mode: "0644"
     force: false
@@ -840,7 +885,7 @@
     name: "{{ item }}"
     enabled: true
     masked: false      # hostapd ships masked on Debian/RPi OS; enable errors on it
-  loop: [dnsmasq, hostapd, dhcpcd, netmode-converge]
+  loop: [dnsmasq, hostapd, dhcpcd, rasputin-converge]
 
 # --- resolver ---------------------------------------------------------------
 # Ordering here is the whole cutover. The binary is fetched while dnsmasq is
@@ -933,7 +978,7 @@
     mode: "0644"
   notify: restart blocky
 
-# netmode rewrites this on every converge - the DoH endpoints normally, the
+# rasputin rewrites this on every converge - the DoH endpoints normally, the
 # venue's own resolver in plaintext while a captive portal is being cleared.
 # Written here as well so a deploy with converge_on_deploy=false still leaves
 # blocky an upstream at all; a blocky with none fails to start, and this box
@@ -945,7 +990,7 @@
     mode: "0644"
   notify: restart blocky
 
-# netmode rewrites this on every converge. Written here as well so a deploy
+# rasputin rewrites this on every converge. Written here as well so a deploy
 # with converge_on_deploy=false still leaves a resolver that can bind - the
 # same reason the eth0-LAN snippet is installed rather than merely staged.
 - name: Resolver listen addresses for the current mode

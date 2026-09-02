@@ -3,12 +3,12 @@
 # Runs as root via a NOPASSWD rule pinned to this exact path, so it must
 # stay root-owned and non-writable by the login user - see the role.
 s(){ printf '\n-----8<----- %s\n' "$1"; }
-s netmode;  /usr/local/sbin/netmode status 2>&1
+s rasputin;  /usr/local/sbin/rasputin status 2>&1
 s wan
 ip -4 route get 1.1.1.1 2>&1 | head -1
 gw=$(ip -4 route show default 2>/dev/null | awk '{print $3; exit}')
 if [ -z "$gw" ]; then echo "gw none"
-elif nft list chain inet netmode output 2>/dev/null | grep -q 'policy drop'; then echo "gw $gw unprobed"
+elif nft list chain inet rasputin output 2>/dev/null | grep -q 'policy drop'; then echo "gw $gw unprobed"
 elif rtt=$(ping -c 1 -W 2 "$gw" 2>/dev/null | awk -F'time=' '/time=/{split($2,a," ");print a[1]}'); [ -n "$rtt" ]; then echo "gw $gw reachable $rtt"
 else echo "gw $gw unreachable"
 fi

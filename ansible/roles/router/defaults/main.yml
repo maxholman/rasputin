@@ -57,7 +57,7 @@ purge_raspap_packages: true
 # The persistence layer, not iptables itself. netfilter-persistent restores
 # /etc/iptables/rules.v4 at every boot, and that is the only thing still
 # creating table ip nat - a second author of the packet path beside table inet
-# netmode. The rules file is already empty of rules, so this removes the
+# rasputin. The rules file is already empty of rules, so this removes the
 # mechanism rather than any filtering.
 #
 # The iptables package STAYS. network-manager and docker-ce both depend on it,
@@ -68,7 +68,7 @@ purge_iptables_persistent: true
 # One failing unit costs this box most of its boot. NetworkManager-wait-online
 # waits 60s for a managed connection that never comes - NM holds only lo and
 # eth0 here, and eth0 it did not bring up - then fails. network-online.target
-# sits behind it, dnsmasq sits behind that, and netmode's converge blocks on
+# sits behind it, dnsmasq sits behind that, and rasputin's converge blocks on
 # `systemctl restart dnsmasq`, so the whole boot waits out the timeout: no DHCP
 # and no DNS for the house for the first minute after a reboot.
 #
@@ -102,9 +102,9 @@ debian_suite: trixie
 # the smartcard daemon, and the compiler and kernel headers - there is no dkms
 # here, so nothing builds a module.
 #
-# NOT included, on purpose: avahi, which netmode silences per-interface and so
+# NOT included, on purpose: avahi, which rasputin silences per-interface and so
 # depends on; NetworkManager, which a fresh install ships anyway and which
-# iptables depends on; and dhcpcd, whose config netmode rewrites.
+# iptables depends on; and dhcpcd, whose config rasputin rewrites.
 strip_to_basics: true
 
 # Who administers this box. pi came with the SD card image and was never
@@ -129,7 +129,7 @@ remove_legacy_admin: true
 # SSH. Key auth is already how every path into this box works, so the password
 # path is a second way in that nothing depends on. It matters more than it looks
 # because sshd binds 0.0.0.0 and the input chain is the ONLY thing keeping :22
-# off the venue - and `netmode rollback-fire` deletes that table wholesale.
+# off the venue - and `rasputin rollback-fire` deletes that table wholesale.
 harden_ssh: true
 
 # Exactly who may log in. The file is written WHOLE, not appended to: an
@@ -161,7 +161,7 @@ randomize_client_mac: true
 # wrong. mode=serve means eth0 FEEDS a downstream network; mode=uplink means
 # eth0 CONSUMES the venue's.
 # ---------------------------------------------------------------------------
-netmode_profiles:
+rasputin_profiles:
   home: { mode: serve, vpn: false } # 5G hotspot upstream, no tunnel
   hotel-wifi: { mode: serve, vpn: true } # venue wifi upstream, tunnel + killswitch
   hotel-eth: { mode: uplink, vpn: true } # venue ethernet upstream, tunnel + killswitch
@@ -258,7 +258,7 @@ blocky_doh_port: 443
 killswitch_restrict_output: true
 
 # ---------------------------------------------------------------------------
-# Captive portals. `netmode portal` opens a bounded hole - tunnel down, clients
+# Captive portals. `rasputin portal` opens a bounded hole - tunnel down, clients
 # limited to :80/:443, DNS plaintext to the venue's own resolver - for long
 # enough to complete a login page, then converges back to the declared profile
 # on its own. The window is the only thing standing between a hotel lobby and
@@ -267,7 +267,7 @@ killswitch_restrict_output: true
 portal_timeout: 900
 
 # Addresses, not names: the probe has to work with DNS already broken. See
-# portal_probe() in netmode for why. Both are Cloudflare anycast for the same
+# portal_probe() in rasputin for why. Both are Cloudflare anycast for the same
 # service, so they answer from whichever continent you are on - add your own if
 # a venue blackholes them, keeping to endpoints that return 204.
 portal_probe_targets:

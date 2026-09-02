@@ -184,7 +184,7 @@ struct Status {
     host: String,
     hostname: String,
     uptime_secs: u64,
-    netmode: HashMap<String, String>, // "profile", "vpn (wg0)", ...
+    rasputin: HashMap<String, String>, // "profile", "vpn (wg0)", ...
     wan_path: String,       // `ip route get 1.1.1.1`, first line
     wan_gw: String,  // "10.31.0.1 reachable 1.2" (ms) | "... unreachable" | "... unprobed" | "none"
     wan_tcp: String,   // TCP 1.1.1.1:443 from the box: "open 34" (ms) | "no-path"
@@ -235,10 +235,10 @@ fn collect(opts: &Opts, host: &str, sudo_pw: Option<&str>) -> Status {
         Err(e) => st.error = Some(e),
         Ok(raw) => {
             let sections = parse_sections(&raw);
-            if let Some(nm) = sections.get("netmode") {
+            if let Some(nm) = sections.get("rasputin") {
                 for line in nm.lines() {
                     if let Some((k, v)) = line.split_once(':') {
-                        st.netmode.insert(k.trim().to_string(), v.trim().to_string());
+                        st.rasputin.insert(k.trim().to_string(), v.trim().to_string());
                     }
                 }
             }
@@ -527,7 +527,7 @@ fn wg_handshake(st: &Status) -> Option<String> {
 }
 
 fn ports(st: &Status) -> Vec<Port> {
-    let profile = st.netmode.get("profile").cloned().unwrap_or_default();
+    let profile = st.rasputin.get("profile").cloned().unwrap_or_default();
     let up_if = uplink_if(&profile);
     let mut out = Vec::new();
     for iface in ["wlan0", "wlan1", "eth0"] {
@@ -618,7 +618,7 @@ fn ports(st: &Status) -> Vec<Port> {
 /// to hear it. `None` = the profile is not one we know, so nothing is judged;
 /// `Some([])` = the box is doing what it said it would.
 fn faults(st: &Status) -> Option<Vec<String>> {
-    let profile = st.netmode.get("profile").cloned().unwrap_or_default();
+    let profile = st.rasputin.get("profile").cloned().unwrap_or_default();
     let want_vpn = vpn_expected(&profile)?;
     let mut f = Vec::new();
 
@@ -637,14 +637,14 @@ fn faults(st: &Status) -> Option<Vec<String>> {
         if !st.ifaces.contains_key("wg0") {
             f.push("wg0 DOWN - clients have no egress".into());
         }
-        if !st.netmode.get("output guard").map(|g| g.contains("drop")).unwrap_or(false) {
+        if !st.rasputin.get("output guard").map(|g| g.contains("drop")).unwrap_or(false) {
             f.push("kill switch NOT ARMED".into());
         }
     }
     for (name, key) in
         [("dnsmasq", "dnsmasq (dhcp)"), ("blocky", "blocky (dns)"), ("hostapd", "hostapd")]
     {
-        if st.netmode.get(key).map(|v| v != "active").unwrap_or(false) {
+        if st.rasputin.get(key).map(|v| v != "active").unwrap_or(false) {
             f.push(format!("{name} not running"));
         }
     }
@@ -653,7 +653,7 @@ fn faults(st: &Status) -> Option<Vec<String>> {
     }
     // An open portal window is a deliberate hole, not a fault - but it is
     // temporary and you want to be reminded you are standing in it.
-    if st.netmode.get("portal").map(|p| p.starts_with("OPEN")).unwrap_or(false) {
+    if st.rasputin.get("portal").map(|p| p.starts_with("OPEN")).unwrap_or(false) {
         f.push("captive portal window OPEN".into());
     }
     Some(f)
@@ -665,9 +665,9 @@ struct Judged {
 }
 
 fn judge(st: &Status) -> Judged {
-    let profile = st.netmode.get("profile").cloned().unwrap_or_default();
-    let vpn_up = st.netmode.get("vpn (wg0)").map(|v| v == "UP").unwrap_or(false);
-    let guard_raw = st.netmode.get("output guard").cloned().unwrap_or_else(|| "?".into());
+    let profile = st.rasputin.get("profile").cloned().unwrap_or_default();
+    let vpn_up = st.rasputin.get("vpn (wg0)").map(|v| v == "UP").unwrap_or(false);
+    let guard_raw = st.rasputin.get("output guard").cloned().unwrap_or_else(|| "?".into());
     let guard_drop = guard_raw.contains("drop");
     let guard_word: String = if guard_drop {
         "drop".into()
@@ -757,7 +757,7 @@ fn build_lines(
     };
     let pick = |is_bad: bool| if is_bad { bad } else { plain };
 
-    let profile = st.netmode.get("profile").cloned().unwrap_or_else(|| "?".into());
+    let profile = st.rasputin.get("profile").cloned().unwrap_or_else(|| "?".into());
 
     let mut lines = Vec::new();
 
@@ -899,14 +899,14 @@ fn build_lines(
     // "portal: closed" is an internal state name, and a row that says nothing
     // on every ordinary tick trains you to stop reading the section. Shown only
     // when a window is actually open, which is the state worth acting on.
-    if let Some(portal) = st.netmode.get("portal") {
+    if let Some(portal) = st.rasputin.get("portal") {
         if !portal.starts_with("closed") {
             lines.push(kv("portal", portal.clone(), bad));
         }
     }
     // Likewise the MAC: random is the normal, uninteresting case. A pin is not -
     // it means a venue authorised this address and converge is holding it.
-    if let Some(mac) = st.netmode.get("uplink mac") {
+    if let Some(mac) = st.rasputin.get("uplink mac") {
         if !mac.ends_with("random") {
             lines.push(kv("uplink mac", mac.clone(), if mac.contains("NOT APPLIED") { bad } else { dim }));
         }
@@ -927,7 +927,7 @@ fn build_lines(
         }
         lines.push(kv(
             "egress",
-            st.netmode.get("egress").map(|e| fmt_egress(e)).unwrap_or_else(|| "?".into()),
+            st.rasputin.get("egress").map(|e| fmt_egress(e)).unwrap_or_else(|| "?".into()),
             plain,
         ));
         lines.push(Line::default());
@@ -952,7 +952,7 @@ fn build_lines(
     lines.push(section("DNS"));
     let mut svc = vec![label("services")];
     for (name, key) in [("dnsmasq", "dnsmasq (dhcp)"), ("blocky", "blocky (dns)"), ("hostapd", "hostapd")] {
-        let state = st.netmode.get(key).cloned().unwrap_or_else(|| "?".into());
+        let state = st.rasputin.get(key).cloned().unwrap_or_else(|| "?".into());
         let ok = state == "active";
         if ok {
             svc.push(Span::styled(name.to_string(), *plain));
@@ -981,7 +981,7 @@ fn build_lines(
     // A plaintext upstream means portal mode and nothing else, so it is red
     // rather than merely stated. Full URLs are noise here - the host is the
     // part you read - but plaintext is shown verbatim and in full.
-    if let Some(ups) = st.netmode.get("dns upstream") {
+    if let Some(ups) = st.rasputin.get("dns upstream") {
         let plain_dns = ups.starts_with("PLAINTEXT");
         let text = if plain_dns {
             ups.clone()
@@ -1192,7 +1192,7 @@ mod tests {
 
     fn st(profile: &str) -> Status {
         let mut s = Status::default();
-        s.netmode.insert("profile".into(), profile.into());
+        s.rasputin.insert("profile".into(), profile.into());
         s.ifaces.insert("wlan0".into(), "UP 10.31.4.88/24 fe80::1/64".into());
         s.ifaces.insert("wlan1".into(), "UP 10.9.141.1/24".into());
         s.ifaces.insert("eth0".into(), "UP 10.6.141.1/24".into());
@@ -1269,23 +1269,23 @@ mod tests {
     #[test]
     fn faults_are_named_not_implied() {
         let mut s = st("home");
-        s.netmode.insert("dnsmasq (dhcp)".into(), "active".into());
-        s.netmode.insert("blocky (dns)".into(), "active".into());
-        s.netmode.insert("hostapd".into(), "active".into());
+        s.rasputin.insert("dnsmasq (dhcp)".into(), "active".into());
+        s.rasputin.insert("blocky (dns)".into(), "active".into());
+        s.rasputin.insert("hostapd".into(), "active".into());
         s.dns_ok.addrs = vec!["1.2.3.4".into()];
         assert_eq!(faults(&s), Some(vec![]), "a healthy home profile is silent");
 
         // hotel-wifi promises a tunnel and a kill switch; this box has neither.
         let mut h = s.clone();
-        h.netmode.insert("profile".into(), "hotel-wifi".into());
-        h.netmode.insert("output guard".into(), "policy accept".into());
+        h.rasputin.insert("profile".into(), "hotel-wifi".into());
+        h.rasputin.insert("output guard".into(), "policy accept".into());
         let f = faults(&h).unwrap();
         assert!(f.iter().any(|x| x.contains("wg0 DOWN")), "{f:?}");
         assert!(f.iter().any(|x| x.contains("kill switch NOT ARMED")), "{f:?}");
 
         // An unknown profile promises nothing, so nothing is judged.
         let mut u = s.clone();
-        u.netmode.insert("profile".into(), "something-new".into());
+        u.rasputin.insert("profile".into(), "something-new".into());
         assert_eq!(faults(&u), None);
     }
 
