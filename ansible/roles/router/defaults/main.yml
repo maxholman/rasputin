@@ -89,6 +89,12 @@ purge_raspap_api: true
 # workload's only state, and it costs nothing to leave until the rebuild.
 purge_mce888: true
 
+# The apt sources, declared. Upgrading is NOT done by this role - a converge
+# that silently upgraded the box would be a converge you could not predict -
+# but which mirrors it would upgrade FROM is configuration, and belongs here.
+manage_apt_sources: true
+debian_suite: trixie
+
 # Back to basics: what the SD card image dumped on the box that a router has no
 # use for. The container stack (nothing runs in it, and /var/lib/docker is
 # empty), 231MB of locales on a headless box, cloud-init on a box this role

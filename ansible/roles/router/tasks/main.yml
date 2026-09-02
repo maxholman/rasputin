@@ -269,6 +269,41 @@
   failed_when: false
   when: disable_nm_wait_online | bool
 
+# --- apt sources -------------------------------------------------------------
+# Declared because the undeclared version is how this box came to point at a
+# mirror that completes a TLS handshake and then never answers - with a .bak of
+# the stock file sitting beside it, which is the shape of a hand edit nobody
+# wrote down. deb.debian.org is what a stock install uses, and it answers.
+#
+# apt only reads .sources and .list here, so the .bak was inert; it goes
+# because a stale copy of a config file is a thing the next person has to
+# work out the status of.
+- name: Declare the Debian apt sources
+  ansible.builtin.copy:
+    dest: /etc/apt/sources.list.d/debian.sources
+    mode: "0644"
+    backup: true
+    content: |
+      # Managed by rasputin.
+      Types: deb
+      URIs: http://deb.debian.org/debian/
+      Suites: {{ debian_suite }} {{ debian_suite }}-updates
+      Components: main contrib non-free non-free-firmware
+      Signed-By: /usr/share/keyrings/debian-archive-keyring.pgp
+
+      Types: deb
+      URIs: http://deb.debian.org/debian-security/
+      Suites: {{ debian_suite }}-security
+      Components: main contrib non-free non-free-firmware
+      Signed-By: /usr/share/keyrings/debian-archive-keyring.pgp
+  when: manage_apt_sources | bool
+
+- name: Remove the hand edit left beside it
+  ansible.builtin.file:
+    path: /etc/apt/sources.list.d/debian.sources.bak
+    state: absent
+  when: manage_apt_sources | bool
+
 # --- back to basics ----------------------------------------------------------
 # See strip_to_basics. Everything here arrived with the SD card image and none
 # of it has a job on a router. avahi is deliberately NOT in the list: netmode
