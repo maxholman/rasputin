@@ -269,6 +269,72 @@
   failed_when: false
   when: disable_nm_wait_online | bool
 
+# --- back to basics ----------------------------------------------------------
+# See strip_to_basics. Everything here arrived with the SD card image and none
+# of it has a job on a router. avahi is deliberately NOT in the list: netmode
+# references it six times, silencing it per-interface, so removing it would
+# break the converge.
+- name: Remove what the image brought and this router does not use
+  ansible.builtin.apt:
+    name:
+      - docker-ce
+      - docker-ce-cli
+      - docker-ce-rootless-extras
+      - docker-buildx-plugin
+      - docker-compose-plugin
+      - docker-model-plugin
+      - containerd.io
+      - locales-all      # 231MB of locales on a headless box
+      - cloud-init       # five units and a boot delay, on a box this role declares whole
+      - bluez
+      - modemmanager     # the uplink is wifi to a hotspot; there is no modem
+      - udisks2
+      - pcscd            # smartcard daemon
+      - build-essential  # no dkms here, so nothing compiles anything
+    state: absent
+    purge: true
+    autoremove: true
+  when: strip_to_basics | bool
+
+# Queried rather than listed: these package names carry the kernel version, so
+# a hardcoded list goes stale on the next kernel upgrade - and one is queued.
+- name: Find the installed kernel build trees
+  ansible.builtin.shell:
+    cmd: dpkg-query -W -f='${Package}\n' 'linux-headers-*' 'linux-kbuild-*' 2>/dev/null || true
+  register: _kbuild
+  changed_when: false
+  when: strip_to_basics | bool
+
+- name: Remove the kernel build trees
+  ansible.builtin.apt:
+    name: "{{ _kbuild.stdout_lines }}"
+    state: absent
+    purge: true
+    autoremove: true
+  when: strip_to_basics | bool and (_kbuild.stdout_lines | default([]) | length > 0)
+
+- name: Remove the Docker apt source and what cloud-init left
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/apt/sources.list.d/docker.list
+    - /etc/apt/keyrings/docker.asc
+    - /var/lib/cloud
+    - /etc/cloud
+    # The masks below outlive the units they masked - same tombstone problem as
+    # the RaspAP ones. Nothing removes them but this.
+    - /etc/systemd/system/docker.service
+    - /etc/systemd/system/docker.socket
+    - /etc/systemd/system/containerd.service
+  register: _strip_files
+  when: strip_to_basics | bool
+
+- name: Reload systemd after the strip
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when: _strip_files.changed | default(false)
+
 # --- mce888 ------------------------------------------------------------------
 # Removed rather than stopped: the image is kept on the controller, so nothing
 # here is the last copy. The named volume is left alone - see purge_mce888.
@@ -305,7 +371,7 @@
     masked: true
   failed_when: false
   loop: [docker.service, docker.socket, containerd.service]
-  when: purge_mce888 | bool
+  when: purge_mce888 | bool and not (strip_to_basics | bool)
 
 # The mce888 deploy key carried no from= or command= restriction on an account
 # with passwordless sudo, so a key minted to ship a container in another project

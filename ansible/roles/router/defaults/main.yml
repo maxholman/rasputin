@@ -89,6 +89,18 @@ purge_raspap_api: true
 # workload's only state, and it costs nothing to leave until the rebuild.
 purge_mce888: true
 
+# Back to basics: what the SD card image dumped on the box that a router has no
+# use for. The container stack (nothing runs in it, and /var/lib/docker is
+# empty), 231MB of locales on a headless box, cloud-init on a box this role
+# declares whole, Bluetooth, the mobile-modem daemon, the disk-mounting daemon,
+# the smartcard daemon, and the compiler and kernel headers - there is no dkms
+# here, so nothing builds a module.
+#
+# NOT included, on purpose: avahi, which netmode silences per-interface and so
+# depends on; NetworkManager, which a fresh install ships anyway and which
+# iptables depends on; and dhcpcd, whose config netmode rewrites.
+strip_to_basics: true
+
 # Who administers this box. pi came with the SD card image and was never
 # declared anywhere - the role simply assumed whatever it connected as. The
 # image also came from a machine where the user was called max, which is why
