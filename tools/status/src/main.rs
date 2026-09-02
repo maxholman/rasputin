@@ -56,7 +56,7 @@ fn usage() -> ! {
 fn parse_args() -> Opts {
     let mut o = Opts {
         host: None,
-        user: "pi".into(),
+        user: "max".into(),
         identity: None,
         interval: Duration::from_secs(2),
         once: false,
