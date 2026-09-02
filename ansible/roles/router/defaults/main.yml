@@ -43,6 +43,19 @@ converge_on_deploy: true
 # route around the blocklist and the DoH upstream. Nothing here depends on it.
 purge_raspap: true
 
+# purge_raspap only ever masked and disabled - it neutered RaspAP, it never
+# removed it. This is the removal: the packages, /etc/raspap and its dated
+# backups, the four web roots, and the units and binaries left behind by an
+# installer that was a shell script rather than a package, so apt does not know
+# about them. One of those units, routing.service, would overwrite
+# /etc/nftables.conf with RaspAP's own ruleset if anything ever enabled it.
+#
+# hostapd and dnsmasq are deliberately NOT in the list: they are the AP and the
+# DHCP server, not RaspAP's. iptables stays for now because netfilter-persistent
+# is neutered rather than gone and table ip nat still exists - that wants its
+# own change and its own reboot proof.
+purge_raspap_packages: true
+
 # Separate from purge_raspap because it removes a different kind of thing: the
 # half of RaspAP that listens. restapi.service is a uvicorn app on 0.0.0.0:8081
 # whose endpoints shell out, read /etc/wireguard and return the AP passphrase in

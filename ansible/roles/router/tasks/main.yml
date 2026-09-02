@@ -12,6 +12,10 @@
 # raspapd is a oneshot that runs at EVERY boot, and its job includes disabling
 # systemd-networkd. Stopping it is not enough - it is masked so nothing can pull
 # it back in by dependency, and so it cannot undo the networkd migration.
+#
+# Skipped once purge_raspap_packages has taken the unit file: masking a unit
+# that is gone re-creates the mask that the purge then deletes, and the two
+# tasks report changed at each other forever.
 - name: Mask RaspAP daemon
   ansible.builtin.systemd:
     name: raspapd
@@ -19,7 +23,7 @@
     enabled: false
     masked: true
   failed_when: false
-  when: purge_raspap | bool
+  when: purge_raspap | bool and not (purge_raspap_packages | bool)
 
 - name: Stop and disable the RaspAP web UI
   ansible.builtin.systemd:
@@ -83,6 +87,8 @@
 # disabled for the same reason raspapd is: a thing that runs at boot and
 # reconfigures the router must not be able to return by dependency. Nothing
 # depends on them - netmode owns every knob they offer.
+#
+# Skipped once the unit files are gone, for the reason given at raspapd above.
 - name: Mask the RaspAP REST API and its network monitor
   ansible.builtin.systemd:
     name: "{{ item }}"
@@ -93,7 +99,7 @@
   loop:
     - restapi.service
     - "raspap-network-activity@{{ wan_wifi_if }}.service"
-  when: purge_raspap_api | bool
+  when: purge_raspap_api | bool and not (purge_raspap_packages | bool)
 
 # The web UI's tail. php-fpm is the FastCGI backend for the UI that is already
 # disabled and it listens on a unix socket, not a port, so this is surface
@@ -133,6 +139,95 @@
       # netmode at every converge and rebuilt at boot. Nothing else claims a
       # hook here - no flush on purpose, see the role task.
   when: purge_raspap | bool
+
+# --- what masking left behind ------------------------------------------------
+# See purge_raspap_packages. Ordered removal-last: the units are already masked
+# and the daemons already stopped, so nothing here is taking a running service
+# away from the box.
+- name: Remove the RaspAP web stack
+  ansible.builtin.apt:
+    name:
+      - lighttpd
+      - lighttpd-mod-deflate
+      - lighttpd-mod-openssl
+      - php8.4-fpm
+      - php8.4-cli
+      - php8.4-common
+      - php8.4-opcache
+      - php8.4-readline
+      - php-common
+      - openvpn          # the tunnel here is wireguard; this never ran
+      - vnstat           # RaspAP's bandwidth graphs; the status panel reads /proc/net/dev
+    state: absent
+    purge: true
+    autoremove: true
+  when: purge_raspap_packages | bool
+
+# Globbed rather than listed: the installer leaves a dated copy of both trees
+# each time it runs - three under /etc, four web roots - so the set grows and
+# naming them individually goes stale. /etc/lighttpd goes too: purging the
+# package takes its own conffiles, but 50-raspap-router.conf was dropped in by
+# the installer, so dpkg does not know it is there.
+- name: Find every RaspAP config tree and web root
+  ansible.builtin.find:
+    paths: "{{ item.path }}"
+    patterns: "{{ item.pattern }}"
+    file_type: any
+    depth: 1
+  loop:
+    - { path: /etc, pattern: "raspap*" }
+    - { path: /var/www, pattern: "htm*" }
+  register: _raspap_trees
+  when: purge_raspap_packages | bool
+
+- name: Remove the RaspAP config trees and web roots
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop: >-
+    {{ (_raspap_trees.results | default([]) | map(attribute='files', default=[])
+        | flatten | map(attribute='path') | list) + ['/etc/lighttpd'] }}
+  when: purge_raspap_packages | bool
+
+# RaspAP installs by shell script, so apt has no record of these units or the
+# binaries they run. The masks in /etc go with them - a mask pointing at a unit
+# file that no longer exists is a tombstone, not a guard.
+#
+# routing.service is the one worth removing on its own merits. It is a disabled
+# oneshot that writes /etc/nftables.conf from a heredoc - RaspAP's own AP
+# masquerade, table inet ap - and then enables nftables. One systemctl enable,
+# or one dependency picking it up, and it replaces the live ruleset this role
+# manages. Disabled is not the same as harmless.
+- name: Remove the orphaned RaspAP units and the binaries they run
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /lib/systemd/system/raspapd.service
+    - /lib/systemd/system/restapi.service
+    - /lib/systemd/system/raspap-network-activity@.service
+    - /etc/systemd/system/raspapd.service
+    - /etc/systemd/system/restapi.service
+    - "/etc/systemd/system/raspap-network-activity@{{ wan_wifi_if }}.service"
+    - /etc/systemd/system/routing.service
+    - /usr/local/bin/raspap-network-monitor
+    - /usr/local/bin/raspap-routing.sh
+    # The enablement links, which nothing else removes: systemctl enable wrote
+    # them, so dpkg does not own them and purging the package leaves them
+    # behind. A .wants link to a unit file that is gone is not inert - boot
+    # still tries to pull the unit in and fails. openvpn-client@client is here
+    # for the same reason the package is: RaspAP enabled it, it never ran.
+    - /etc/systemd/system/multi-user.target.wants/raspapd.service
+    - /etc/systemd/system/multi-user.target.wants/restapi.service
+    - "/etc/systemd/system/multi-user.target.wants/raspap-network-activity@{{ wan_wifi_if }}.service"
+    - /etc/systemd/system/multi-user.target.wants/openvpn-client@client.service
+  register: _raspap_units
+  when: purge_raspap_packages | bool
+
+- name: Reload systemd after removing units
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when: _raspap_units.changed | default(false)
 
 # --- mce888 ------------------------------------------------------------------
 # Removed rather than stopped: the image is kept on the controller, so nothing
