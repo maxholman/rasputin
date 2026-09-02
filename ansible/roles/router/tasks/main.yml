@@ -221,6 +221,13 @@
     - /etc/systemd/system/multi-user.target.wants/restapi.service
     - "/etc/systemd/system/multi-user.target.wants/raspap-network-activity@{{ wan_wifi_if }}.service"
     - /etc/systemd/system/multi-user.target.wants/openvpn-client@client.service
+    # A bridge named br0 with eth0 as its member. systemd-networkd is disabled
+    # here so neither file does anything today, and br0 does not exist - but
+    # enabling networkd would silently enslave the LAN leg into a bridge this
+    # role does not know about. Same shape as routing.service: inert until
+    # something turns its engine on.
+    - /etc/systemd/network/raspap-bridge-br0.netdev
+    - /etc/systemd/network/raspap-br0-member-eth0.network
   register: _raspap_units
   when: purge_raspap_packages | bool
 
@@ -229,17 +236,62 @@
     daemon_reload: true
   when: _raspap_units.changed | default(false)
 
+# --- the last author of table ip nat ----------------------------------------
+# See purge_iptables_persistent. The live table survives until the next boot -
+# nothing here flushes it, because a flush races netmode for the ruleset. It
+# goes by not being restored, which is also what proves this worked.
+- name: Remove the iptables persistence layer
+  ansible.builtin.apt:
+    name:
+      - iptables-persistent
+      - netfilter-persistent
+    state: absent
+    purge: true
+    autoremove: true
+  when: purge_iptables_persistent | bool
+
+- name: Remove the saved iptables rules
+  ansible.builtin.file:
+    path: /etc/iptables
+    state: absent
+  when: purge_iptables_persistent | bool
+
+# --- the minute the boot spends waiting -------------------------------------
+# See disable_nm_wait_online. Masked rather than disabled: network-online.target
+# Wants it, so disabling alone leaves it one dependency away from coming back,
+# and a Wants on a masked unit is skipped rather than fatal.
+- name: Stop NetworkManager-wait-online holding up the boot
+  ansible.builtin.systemd:
+    name: NetworkManager-wait-online.service
+    state: stopped
+    enabled: false
+    masked: true
+  failed_when: false
+  when: disable_nm_wait_online | bool
+
 # --- mce888 ------------------------------------------------------------------
 # Removed rather than stopped: the image is kept on the controller, so nothing
 # here is the last copy. The named volume is left alone - see purge_mce888.
+- name: Check whether Docker can still be talked to
+  ansible.builtin.stat:
+    path: /var/run/docker.sock
+  register: _docker_sock
+  when: purge_mce888 | bool
+
+# Gated on the socket because the Mask Docker task below takes it away: on every
+# run after the first, docker cannot connect, the removal fails, failed_when
+# swallows it and changed_when reports success anyway. Skipping says what is
+# true - there is no daemon to remove anything from - and the task still does
+# its job on a box that has not been converged yet.
 - name: Remove the mce888 container and image
   ansible.builtin.command: "docker {{ item }}"
   loop:
     - rm --force mce888-sms
     - image rm --force mce888-sms:latest
+  register: _mce888_rm
   failed_when: false
-  changed_when: true
-  when: purge_mce888 | bool
+  changed_when: _mce888_rm.rc == 0
+  when: purge_mce888 | bool and (_docker_sock.stat.exists | default(false))
 
 # Masked, not merely stopped. Docker installs its own base chains and a bridge
 # at every start, and those chains are the one part of this box's packet path
@@ -476,6 +528,11 @@
 # where RaspAP's blanket masquerade comes back from. NAT belongs to nftables
 # now, so the nat table is emptied. Docker adds its own rules at runtime and is
 # unaffected. The 192.168.50.0/24 rule referenced a subnet that does not exist.
+#
+# Skipped once purge_iptables_persistent has removed the restorer and the
+# directory this writes into: emptying a file nothing reads is at best a no-op,
+# and here it is an error, because the task would have to recreate /etc/iptables
+# to write it.
 - name: Stop netfilter-persistent restoring RaspAP's blanket NAT
   ansible.builtin.copy:
     dest: /etc/iptables/rules.v4
@@ -489,6 +546,7 @@
       :OUTPUT ACCEPT [0:0]
       :POSTROUTING ACCEPT [0:0]
       COMMIT
+  when: not (purge_iptables_persistent | bool)
 
 # wlan0 presents a fresh MAC to each SSID, and a random one while merely
 # scanning - otherwise the real MAC is broadcast before you ever associate.
