@@ -323,12 +323,48 @@
     fail_msg: "admin_ssh_keys is empty or malformed - refusing to write authorized_keys"
     quiet: true
 
+# --- the admin account ------------------------------------------------------
+# See admin_user. pi came with the SD card image and was never declared here,
+# which is why nothing creates it. This declares its replacement instead.
+#
+# The password is copied from the outgoing account rather than set from a
+# variable, so Max's existing password keeps working and no secret has to live
+# in the vault. Seeded on creation only - update_password: on_create means
+# changing it on the box afterwards sticks. Once the old account is gone this
+# whole seeding step no-ops, and a rebuild from bare metal needs the password
+# set by hand once.
+- name: Read the outgoing account's password hash
+  ansible.builtin.getent:
+    database: shadow
+    key: "{{ legacy_admin_user }}"
+  no_log: true
+  failed_when: false
+  when: admin_user != legacy_admin_user
+
+- name: Create the admin account
+  ansible.builtin.user:
+    name: "{{ admin_user }}"
+    groups: "{{ admin_groups }}"
+    append: true
+    shell: /bin/bash
+    create_home: true
+    password: "{{ (ansible_facts.getent_shadow | default({}))[legacy_admin_user][0] | default(omit) }}"
+    update_password: on_create
+  no_log: true
+
+- name: Give the admin account an ssh directory
+  ansible.builtin.file:
+    path: "/home/{{ admin_user }}/.ssh"
+    state: directory
+    owner: "{{ admin_user }}"
+    mode: "0700"
+
 # Looped, not joined: Ansible leaves the \n in join('\n') as two literal
 # characters, so every key past the first lands on a line sshd cannot parse.
 - name: Declare who may log in
   ansible.builtin.copy:
-    dest: "/home/{{ ansible_user }}/.ssh/authorized_keys"
-    owner: "{{ ansible_user }}"
+    dest: "/home/{{ admin_user }}/.ssh/authorized_keys"
+    owner: "{{ admin_user }}"
     mode: "0600"
     backup: true
     content: |
@@ -337,9 +373,33 @@
       {{ key }}
       {% endfor %}
 
+# Came with the SD card image: `max ALL=(ALL) NOPASSWD: ALL` for an account
+# that did not exist on this box. Dormant only while nobody creates that user -
+# which is exactly what this role now does. The filename is a lie as well; it
+# is called 010_pi-nopasswd and grants pi nothing.
+- name: Remove the image's stray root grant
+  ansible.builtin.file:
+    path: /etc/sudoers.d/010_pi-nopasswd
+    state: absent
+
+# The one step in this role that cannot be walked back from the controller:
+# after it, the only way in is admin_user's key. Hence two gates - the flag,
+# turned on only once that login and its sudo have been proved by hand, and the
+# refusal to delete whichever account this run is connected as.
+- name: Remove the account the image shipped with
+  ansible.builtin.user:
+    name: "{{ legacy_admin_user }}"
+    state: absent
+    remove: true
+    force: true
+  when:
+    - remove_legacy_admin | bool
+    - admin_user != legacy_admin_user
+    - ansible_user != legacy_admin_user
+
 - name: Remove the mce888 environment file
   ansible.builtin.file:
-    path: "/home/{{ ansible_user }}/mce888-sms.env"
+    path: "/home/{{ legacy_admin_user }}/mce888-sms.env"
     state: absent
   when: purge_mce888 | bool
 
@@ -401,7 +461,7 @@
 # `sudo bash -s`, which no sudoers rule can narrow: allowing that is allowing
 # root. A fixed root-owned script can be pinned by path instead.
 #
-# root-owned and not writable by {{ ansible_user }} - the NOPASSWD rule below
+# root-owned and not writable by {{ admin_user }} - the NOPASSWD rule below
 # makes anyone who can edit this file root.
 - name: Install the status facts script
   ansible.builtin.copy:
@@ -423,7 +483,7 @@
     validate: /usr/sbin/visudo -cf %s
     content: |
       # Managed by rasputin.
-      {{ ansible_user }} ALL=(root) NOPASSWD: /usr/local/sbin/rasputin-facts
+      {{ admin_user }} ALL=(root) NOPASSWD: /usr/local/sbin/rasputin-facts
 
 # --- config ----------------------------------------------------------------
 - name: Create netmode directories

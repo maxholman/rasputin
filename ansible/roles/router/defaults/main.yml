@@ -89,6 +89,25 @@ purge_raspap_api: true
 # workload's only state, and it costs nothing to leave until the rebuild.
 purge_mce888: true
 
+# Who administers this box. pi came with the SD card image and was never
+# declared anywhere - the role simply assumed whatever it connected as. The
+# image also came from a machine where the user was called max, which is why
+# pi's primary group is `max` and why a sudoers file granting max full root
+# was sitting there waiting for the account to exist.
+admin_user: max
+legacy_admin_user: pi
+
+# append: true, so this adds to whatever primary group the account has rather
+# than replacing it. sudo is the one that matters; the rest are the hardware
+# groups the image gave pi, kept so the new account can reach the same devices.
+admin_groups: [sudo, adm, dialout, video, plugdev, input, netdev, spi, i2c, gpio]
+
+# The point of no return, so it is off by default. Turn it on only once
+# admin_user has been proved to log in by key AND run sudo, on a real login -
+# not inferred from a successful ansible run, which proves the old account
+# still works rather than the new one. See the task for the second gate.
+remove_legacy_admin: true
+
 # SSH. Key auth is already how every path into this box works, so the password
 # path is a second way in that nothing depends on. It matters more than it looks
 # because sshd binds 0.0.0.0 and the input chain is the ONLY thing keeping :22
