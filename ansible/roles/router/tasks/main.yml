@@ -269,6 +269,29 @@
   failed_when: false
   when: disable_nm_wait_online | bool
 
+# dpkg writes a .dpkg-dist beside any conffile it did not overwrite, which with
+# --force-confold on an upgrade means every packaged config this box declares
+# for itself. They are inert, and each one is a second copy of a config file
+# with no indication of which is live - the same confusion debian.sources.bak
+# caused. Every config that matters here is written by this role, so the
+# packaged variant carries nothing we act on.
+#
+# The trade-off, stated: this also discards the only notice that an upstream
+# conffile changed. Acceptable on a box whose configs are declared and
+# re-asserted at every converge; it would not be on a general-purpose machine.
+- name: Find dpkg's leftover copies of config files
+  ansible.builtin.find:
+    paths: /etc
+    patterns: ["*.dpkg-dist", "*.dpkg-old", "*.dpkg-new", "*.ucf-dist"]
+    recurse: true
+  register: _dpkg_leftovers
+
+- name: Remove dpkg's leftover copies
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop: "{{ _dpkg_leftovers.files | default([]) | map(attribute='path') | list }}"
+
 # --- apt sources -------------------------------------------------------------
 # Declared because the undeclared version is how this box came to point at a
 # mirror that completes a TLS handshake and then never answers - with a .bak of
