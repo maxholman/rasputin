@@ -5,6 +5,7 @@
 #   rasputin uplink    {{ eth_if }} TAKES an address from the venue ethernet
 #   rasputin status    show declared vs actual
 #   rasputin converge  re-apply the declared mode (runs at boot)
+#   rasputin refresh   re-apply the firewall for the uplink's current address
 #   rasputin portal    open a bounded hole to clear a captive portal
 #   rasputin mac-new   drop the pinned uplink MAC, take a fresh identity
 #
@@ -842,6 +843,51 @@ converge() {
   echo "rasputin: converged to '$profile' (mode=$mode uplink=$uplink egress=$([[ $VPN == 1 ]] && echo "$VPN_IF" || echo "$uplink")$([[ $portal == 1 ]] && echo " PORTAL"))"
 }
 
+# The uplink's address is not a constant. A phone hotspot re-issues on a fresh
+# subnet every time it comes back, and a venue lease can land anywhere. That
+# matters because apply_firewall bakes the CURRENT uplink subnet and gateway
+# into the ruleset: the venue-lateral drop and the captive-portal exception are
+# both literal addresses. Nothing re-ran it between boots, so this box spent
+# seven hours dropping traffic to a subnet it had left and holding a portal
+# exception open to a gateway that no longer existed - while the network it was
+# actually on had neither.
+#
+# refresh re-applies the gate for the address the uplink has NOW and does
+# nothing else: no MAC change, no reassociation, no service restart. That is
+# what makes it cheap enough to hang off a DHCP event.
+refresh() {
+  local profile; profile=$(cat "$STATE" 2>/dev/null) || die "no declared profile at $STATE"
+  local MODE VPN MACRAND; resolve_profile "$profile"
+  local portal=0
+  if portal_active; then portal=1; VPN=0; fi
+  local uplink; [[ $MODE == serve ]] && uplink="$WIFI" || uplink="$ETH"
+  # The DHCP hook fires for every interface. Only the uplink's address is baked
+  # into the ruleset, so a lease on a LAN leg is not a reason to rebuild it -
+  # and the hook must not need to know which leg is the uplink to say so.
+  if [[ -n ${REFRESH_IF:-} && $REFRESH_IF != "$uplink" ]]; then return 0; fi
+  apply_firewall "$uplink" "$MODE" "$VPN" "$portal" \
+    || die "firewall apply failed; previous ruleset left intact"
+  flush_stale_nat
+  echo "rasputin: firewall refreshed for $uplink $(ip -4 -o addr show dev "$uplink" | awk '{print $4}' | head -1)"
+}
+
+# Masquerade bindings outlive the address they were built from. When the uplink
+# renumbers, every established flow keeps rewriting to the old source and the
+# replies come back to nobody - the connection is not reset, it just stops, and
+# a TCP entry sits there for days. It is why a resolver holding one long-lived
+# DoH connection keeps timing out long after the link is healthy again.
+#
+# --src-nat, not -F: only the NAT'd flows carry a stale source. Flushing
+# everything would take the admin SSH session on the LAN with it, which is the
+# session you are using when you need this.
+flush_stale_nat() {
+  command -v conntrack >/dev/null 2>&1 || {
+    echo "rasputin: WARNING - conntrack not installed; stale NAT bindings left to time out" >&2
+    return 0
+  }
+  conntrack -D --src-nat >/dev/null 2>&1 || true
+}
+
 portal_status_line() {
   local exp
   if portal_active; then
@@ -907,12 +953,14 @@ mkdir -p "$STATE_DIR"
 ROLLBACK=""
 PORTAL_SECS=""
 PORTAL_CHECK=""
+REFRESH_IF=""
 cmd="${1:-}"; shift || true
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --rollback) ROLLBACK="${2:?--rollback needs seconds}"; shift 2 ;;
     --for)      PORTAL_SECS="${2:?--for needs seconds}"; shift 2 ;;
     --check)    PORTAL_CHECK=1; shift ;;
+    --if)       REFRESH_IF="${2:?--if needs an interface}"; shift 2 ;;
     *) die "unknown option: $1" ;;
   esac
 done
@@ -929,6 +977,7 @@ case "$cmd" in
   # Naming a profile is how you LEAVE portal mode. Bare `converge` is not:
   # that is what boot runs, and a reboot must not silently drop the window.
   converge) converge ;;
+  refresh)  refresh ;;
   portal)   if [[ -n $PORTAL_CHECK ]]; then portal_check; else portal_open; fi ;;
   portal-expire)
     echo "rasputin: portal window expired - restoring '$(cat "$STATE" 2>/dev/null || echo '?')'" >&2
@@ -937,5 +986,5 @@ case "$cmd" in
   confirm)  cancel_rollback ;;
   rollback-fire) rollback_fire ;;
   status)   status ;;
-  *) die "usage: rasputin {{'{'}}{{ rasputin_profiles.keys()|join('|') }}|serve|uplink|converge|confirm|status|portal|mac-new{{'}'}}\n              [--rollback SECS] [--for SECS] [--check]\n  serve   = {{ eth_if }} FEEDS the wired net (this is UniFi WAN)\n  uplink  = {{ eth_if }} TAKES an address from the venue\n  portal  = open a bounded hole to clear a captive portal (--check only probes)\n  mac-new = drop the pinned uplink MAC and take a fresh identity" ;;
+  *) die "usage: rasputin {{'{'}}{{ rasputin_profiles.keys()|join('|') }}|serve|uplink|converge|refresh|confirm|status|portal|mac-new{{'}'}}\n              [--rollback SECS] [--for SECS] [--check]\n  serve   = {{ eth_if }} FEEDS the wired net (this is UniFi WAN)\n  uplink  = {{ eth_if }} TAKES an address from the venue\n  refresh = re-apply the firewall for the uplink's current address\n  portal  = open a bounded hole to clear a captive portal (--check only probes)\n  mac-new = drop the pinned uplink MAC and take a fresh identity" ;;
 esac

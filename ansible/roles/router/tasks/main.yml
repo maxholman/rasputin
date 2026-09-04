@@ -22,6 +22,16 @@
     state: stopped
     enabled: false
     masked: true
+# Separate, and allowed to fail, precisely because of the comment above: this
+# one is not already on the box, so it is the only apt task here that needs a
+# working uplink. A deploy at a venue with no internet must not die on it -
+# `rasputin refresh` warns and leaves the stale NAT bindings to time out, which
+# is what happens today anyway.
+- name: Install conntrack, so a renumbered uplink can drop its stale NAT bindings
+  ansible.builtin.apt:
+    name: conntrack
+    state: present
+  register: _conntrack_pkg
   failed_when: false
   when: purge_raspap | bool and not (purge_raspap_packages | bool)
 
@@ -44,6 +54,10 @@
     path: /etc/sudoers.d/090_raspap
     state: absent
   when: purge_raspap | bool
+- name: Warn if conntrack could not be installed
+  ansible.builtin.debug:
+    msg: "conntrack not installed - after an uplink renumbers, flows will hang until conntrack times them out"
+  when: _conntrack_pkg.failed | default(false)
 
 # raspapd's boot job was, undocumented, the only thing starting wpa_supplicant
 # on wlan0. The first reboot after masking it came up with the AP beaconing
@@ -791,6 +805,35 @@
     path: /etc/dhcpcd.conf
     regexp: '^duid$'
     replace: '#duid  # rasputin: stable across MAC changes, defeats randomisation'
+
+# The uplink renumbering is a routine event on a travel router - a hotspot that
+# comes back on a new subnet, a venue lease from a different range - and until
+# this hook existed nothing told the firewall. converge runs at boot and when
+# you name a profile, and a hotspot coming back on a different subnet is
+# neither.
+- name: Re-apply the firewall when the uplink takes a new address
+  ansible.builtin.copy:
+    dest: /etc/dhcpcd.exit-hook
+    mode: "0755"
+    content: |
+      # Managed by Ansible. Edit the role, not this file.
+      #
+      # dhcpcd sources this for every event on every interface, so it stays
+      # cheap and defers the "is this the uplink?" question to rasputin, which
+      # is the only thing that knows which leg that is in the current mode.
+      case "$reason" in
+        BOUND|REBIND|REBOOT|RENEW) ;;
+        *) return 0 ;;
+      esac
+      [ -n "$new_ip_address" ] || return 0
+      [ "$new_ip_address" = "$old_ip_address" ] && return 0
+      # Detached, because dhcpcd blocks on its hooks and it is still holding the
+      # lease the new ruleset is about to be built from. Being a unit also means
+      # the refresh reports its own success or failure into the journal.
+      systemd-run --quiet --collect \
+        --unit="rasputin-refresh-$interface" \
+        --description="re-apply the firewall for $interface's new address" \
+        /usr/local/sbin/rasputin refresh --if "$interface" || true
 
 # --- DoH certificate ---------------------------------------------------------
 # Must come before rasputin is templated: rasputin generates blocky's listen
