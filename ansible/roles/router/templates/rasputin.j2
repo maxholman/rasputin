@@ -8,6 +8,8 @@
 #   rasputin refresh   re-apply the firewall for the uplink's current address
 #   rasputin portal    open a bounded hole to clear a captive portal
 #   rasputin mac-new   drop the pinned uplink MAC, take a fresh identity
+#   rasputin join      put a venue's wifi in the supplicant config and join it
+#   rasputin forget    remove a network join wrote
 #
 # Managed by Ansible. Edit the role, not this file.
 set -euo pipefail
@@ -461,6 +463,186 @@ reassociate_wifi() {
     sleep 1
   done
   echo "rasputin: WARNING - $WIFI has no address after MAC change" >&2
+}
+
+# --- joining a venue network ----------------------------------------------
+# Nothing in the role declares network={} blocks, so before this the only way
+# onto a venue's wifi was hand-editing WPA_CONF as root on a box whose uplink
+# is by definition not working yet - the worst possible moment to be writing
+# config from memory. This is that edit, made once and tested.
+#
+# Blocks written here are fenced by markers naming their SSID. Anything
+# outside a fence belongs to someone else - the home hotspot's block predates
+# this tool and is declared nowhere - so join replaces only its own fence and
+# never rewrites the file wholesale.
+JOIN_TAG='rasputin network'
+join_begin() { printf '# >>> %s: %s >>>' "$JOIN_TAG" "$1"; }
+join_end()   { printf '# <<< %s: %s <<<' "$JOIN_TAG" "$1"; }
+
+# Exact string comparison against the fence lines rather than a sed range: an
+# SSID is arbitrary text off a hotel card, and as a sed address one carrying
+# regex metacharacters would delete the wrong lines or fail to compile at all.
+wpa_strip_block() {
+  awk -v b="$(join_begin "$1")" -v e="$(join_end "$1")" '
+    $0 == b { inside = 1 }
+    !inside { print }
+    $0 == e { inside = 0 }
+  ' "$2"
+}
+
+# wpa_passphrase derives the 256-bit key so the venue passphrase is not left
+# in the config in clear. Its own output also echoes the plaintext back on a
+# `#psk=` comment line, which would defeat the exercise entirely - so take the
+# derived line and nothing else.
+wpa_derive_psk() {
+  local out
+  out=$(wpa_passphrase "$1" "$2" 2>&1) || die "wpa_passphrase rejected that passphrase"
+  printf '%s' "$out" | grep -oE '^[[:space:]]*psk=[0-9a-f]{64}$' | tr -d '[:space:]'
+}
+
+join_network() {
+  local ssid="${1:-}" pass="${2:-}" tmp top priority psk kind n
+  [[ -n $ssid ]] || die "join needs an SSID:\n  rasputin join <ssid> [passphrase]\n  rasputin join --scan   (list what is on the air)"
+  [[ -f $WPA_CONF ]] || die "$WPA_CONF is missing - nothing to join into"
+  # wpa_supplicant has escaping rules for these inside a quoted ssid, and a
+  # venue whose SSID needs them is rare enough that guessing wrong - and
+  # silently never associating - is the worse outcome than refusing here.
+  [[ $ssid != *'"'* && $ssid != *'\'* ]] || die "SSIDs containing quotes or backslashes must be added by hand"
+  # A newline would close the ssid line and let the remainder of the argument
+  # land in the config as directives of its own.
+  [[ $ssid != *[[:cntrl:]]* ]] || die "SSIDs cannot contain control characters"
+
+  kind=open
+  if [[ -n $pass ]]; then
+    kind=WPA2
+    # WPA's own limit. Checked here so the error names the actual problem
+    # instead of relaying wpa_passphrase's rather less obvious complaint.
+    n=${{'{'}}#pass}
+    (( n >= 8 && n <= 63 )) || die "WPA passphrases are 8-63 characters - that one is $n"
+    psk=$(wpa_derive_psk "$ssid" "$pass") || true
+    [[ -n $psk ]] || die "could not derive a key for \"$ssid\""
+  fi
+
+  tmp=$(mktemp)
+  wpa_strip_block "$ssid" "$WPA_CONF" > "$tmp"
+
+  # Outrank everything already declared. At a venue the phone hotspot is in
+  # your pocket and therefore in range, and with nothing to separate them the
+  # supplicant is free to prefer it - spending exactly the mobile data that
+  # using the venue's wifi is meant to save. Read after the strip, so
+  # re-joining one SSID reclaims its old slot instead of ratcheting upwards.
+  top=$(grep -hoE '^[[:space:]]*priority=[0-9]+' "$tmp" | grep -oE '[0-9]+' | sort -n | tail -1) || true
+  priority=$(( ${top:-0} + 1 ))
+
+  {
+    join_begin "$ssid"; echo
+    echo "# Written by 'rasputin join'. Drop it with 'rasputin forget'."
+    echo "network={"
+    printf '\tssid="%s"\n' "$ssid"
+    if [[ -n $pass ]]; then
+      printf '\t%s\n' "$psk"
+    else
+      # Saying this explicitly is required, not tidiness: with no key_mgmt the
+      # supplicant assumes WPA-PSK, finds no key and never associates. An open
+      # SSID is the normal shape of hotel wifi - the authentication there is
+      # the captive portal, not the link.
+      printf '\tkey_mgmt=NONE\n'
+    fi
+    printf '\tpriority=%s\n' "$priority"
+    echo "}"
+    join_end "$ssid"; echo
+  } >> "$tmp"
+
+  install -m 0600 "$tmp" "$WPA_CONF"; rm -f "$tmp"
+  echo "rasputin: wrote network block for \"$ssid\" ($kind, priority $priority)"
+  wpa_apply "$ssid"
+}
+
+# `wpa_cli reconfigure` re-reads the file in place. Restarting the supplicant
+# would also work and is worse twice over: it drops the association this
+# session may still be arriving over, and it hands a pinned MAC back to the
+# supplicant's own randomisation before the pin can be re-asserted.
+wpa_apply() {
+  local want="$1" i state ssid addr
+  wpa_cli -i "$WIFI" reconfigure >/dev/null 2>&1 \
+    || die "the block is written, but wpa_cli could not reach the supplicant on $WIFI.\n  it will be picked up by: systemctl restart wpa_supplicant@$WIFI"
+
+  for i in $(seq 1 {{ wifi_reassociate_timeout | default(45) }}); do
+    # A wrong passphrase does not fail, it retries - the supplicant parks the
+    # network as TEMP-DISABLED and says nothing. Waiting out the full timeout
+    # to report "did not associate" would name the wrong problem.
+    if wpa_cli -i "$WIFI" list_networks 2>/dev/null | grep -F "$want" | grep -q 'TEMP-DISABLED'; then
+      die "\"$want\" rejected us - the supplicant has parked it as TEMP-DISABLED.\n  a wrong passphrase is the usual cause. re-run join with the right one."
+    fi
+    state=$(wpa_cli -i "$WIFI" status 2>/dev/null | sed -n 's/^wpa_state=//p')
+    ssid=$(wpa_cli -i "$WIFI" status 2>/dev/null | sed -n 's/^ssid=//p')
+    if [[ $state == COMPLETED && $ssid == "$want" ]]; then
+      # Associated is not online. dhcpcd rebinds on the carrier change by
+      # itself; the nudge is for the case where it is still holding the
+      # previous network's lease, which looks identical from up here.
+      dhcpcd -n "$WIFI" >/dev/null 2>&1 || true
+      # || true, because under set -e a failing command substitution takes the
+      # whole script with it and the diagnosis below never gets to print.
+      addr=$(wait_for_v4 "$WIFI") || true
+      if [[ -z $addr ]]; then
+        # Leave nothing worse than we found it. The block just written outranks
+        # every other network, so keeping one that leases nothing means the next
+        # boot prefers a dead uplink over the hotspot that actually works - and
+        # a venue is where that is least survivable.
+        forget_network "$want" >/dev/null 2>&1 || true
+        die "associated to \"$want\", but its DHCP never answered.\n  no usable address, so it has been dropped again and the previous network is back.\n  if the venue is merely slow, retry: rasputin join \"$want\""
+      fi
+      echo "rasputin: associated to \"$want\", $addr on $WIFI"
+      # Associating proves the link and nothing beyond it. At a hotel that is
+      # usually not the same as being online, and one HTTP request is what
+      # separates "connected" from "sitting behind a login page".
+      portal_check || true
+      echo "rasputin: declare a profile to use it: {{ rasputin_profiles.keys()|join(', ') }}"
+      return 0
+    fi
+    sleep 1
+  done
+  die "\"$want\" did not associate.\n  check the name against what is on the air: rasputin join --scan\n  the block stays written and outranks the others until: rasputin forget \"$want\""
+}
+
+# 169.254/16 is not an address, it is dhcpcd giving up: it self-assigns one
+# when the network answers no DHCP at all. Counting it as a lease reports a
+# working uplink that fails on the first packet, and a venue is the worst place
+# to learn that from a timeout. Only a routable address means we arrived.
+wait_for_v4() {
+  local ifc="$1" i addr
+  for i in $(seq 1 20); do
+    addr=$(ip -4 -o addr show dev "$ifc" 2>/dev/null | awk '$4 !~ /^169\.254\./ {print $4; exit}')
+    [[ -n $addr ]] && { printf '%s' "$addr"; return 0; }
+    sleep 1
+  done
+  return 1
+}
+
+# The SSID has to match what is broadcast exactly, and a typo does not fail
+# loudly - the supplicant simply never associates and offers no reason. Taking
+# the name off the air removes the guess.
+wpa_scan() {
+  wpa_cli -i "$WIFI" scan >/dev/null 2>&1 || die "could not reach the supplicant on $WIFI"
+  sleep 3
+  # SSIDs are free to contain spaces, so the name goes last and everything
+  # that has to line up in columns goes before it.
+  wpa_cli -i "$WIFI" scan_results 2>/dev/null | awk -F'\t' '
+    NR > 1 && NF >= 5 && $5 != "" {
+      printf "%5s dBm  %-5s  %s\n", $3, ($4 ~ /WPA|RSN/ ? "WPA" : "open"), $5
+    }' | sort -rn | uniq
+}
+
+forget_network() {
+  local ssid="${1:-}" tmp
+  [[ -n $ssid ]] || die "forget needs an SSID: rasputin forget <ssid>"
+  grep -qF "$(join_begin "$ssid")" "$WPA_CONF" \
+    || die "rasputin did not write a block for \"$ssid\" - it will not remove one it does not own"
+  tmp=$(mktemp)
+  wpa_strip_block "$ssid" "$WPA_CONF" > "$tmp"
+  install -m 0600 "$tmp" "$WPA_CONF"; rm -f "$tmp"
+  wpa_cli -i "$WIFI" reconfigure >/dev/null 2>&1 || true
+  echo "rasputin: forgot \"$ssid\""
 }
 
 AVAHI_CONF=/etc/avahi/avahi-daemon.conf
@@ -997,14 +1179,21 @@ ROLLBACK=""
 PORTAL_SECS=""
 PORTAL_CHECK=""
 REFRESH_IF=""
+JOIN_SCAN=""
+ARGS=()
 cmd="${1:-}"; shift || true
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --rollback) ROLLBACK="${2:?--rollback needs seconds}"; shift 2 ;;
     --for)      PORTAL_SECS="${2:?--for needs seconds}"; shift 2 ;;
     --check)    PORTAL_CHECK=1; shift ;;
+    --scan)     JOIN_SCAN=1; shift ;;
     --if)       REFRESH_IF="${2:?--if needs an interface}"; shift 2 ;;
-    *) die "unknown option: $1" ;;
+    # join takes an SSID and a passphrase positionally, so bare words are now
+    # operands rather than a mistake. Anything shaped like an option still is
+    # one, and a mistyped flag must not be silently swallowed as an SSID.
+    -*) die "unknown option: $1" ;;
+    *)  ARGS+=("$1"); shift ;;
   esac
 done
 
@@ -1022,6 +1211,8 @@ case "$cmd" in
   converge) converge ;;
   refresh)  refresh ;;
   portal)   if [[ -n $PORTAL_CHECK ]]; then portal_check; else portal_open; fi ;;
+  join)     if [[ -n $JOIN_SCAN ]]; then wpa_scan; else join_network "${ARGS[@]}"; fi ;;
+  forget)   forget_network "${ARGS[@]}" ;;
   portal-expire)
     echo "rasputin: portal window expired - restoring '$(cat "$STATE" 2>/dev/null || echo '?')'" >&2
     portal_close; converge ;;
@@ -1029,5 +1220,5 @@ case "$cmd" in
   confirm)  cancel_rollback ;;
   rollback-fire) rollback_fire ;;
   status)   status ;;
-  *) die "usage: rasputin {{'{'}}{{ rasputin_profiles.keys()|join('|') }}|serve|uplink|converge|refresh|confirm|status|portal|mac-new{{'}'}}\n              [--rollback SECS] [--for SECS] [--check]\n  serve   = {{ eth_if }} FEEDS the wired net (this is UniFi WAN)\n  uplink  = {{ eth_if }} TAKES an address from the venue\n  refresh = re-apply the firewall for the uplink's current address\n  portal  = open a bounded hole to clear a captive portal (--check only probes)\n  mac-new = drop the pinned uplink MAC and take a fresh identity" ;;
+  *) die "usage: rasputin {{'{'}}{{ rasputin_profiles.keys()|join('|') }}|serve|uplink|converge|refresh|confirm|status|portal|mac-new|join|forget{{'}'}}\n              [--rollback SECS] [--for SECS] [--check] [--scan]\n  serve   = {{ eth_if }} FEEDS the wired net (this is UniFi WAN)\n  uplink  = {{ eth_if }} TAKES an address from the venue\n  refresh = re-apply the firewall for the uplink's current address\n  portal  = open a bounded hole to clear a captive portal (--check only probes)\n  mac-new = drop the pinned uplink MAC and take a fresh identity\n  join    = join a venue wifi: join <ssid> [passphrase], or --scan to list\n  forget  = drop a network that join wrote: forget <ssid>" ;;
 esac
