@@ -8,20 +8,6 @@
     name: [dnsmasq, hostapd, dhcpcd5, nftables]
     state: present
 
-# --- RaspAP-ectomy ---------------------------------------------------------
-# raspapd is a oneshot that runs at EVERY boot, and its job includes disabling
-# systemd-networkd. Stopping it is not enough - it is masked so nothing can pull
-# it back in by dependency, and so it cannot undo the networkd migration.
-#
-# Skipped once purge_raspap_packages has taken the unit file: masking a unit
-# that is gone re-creates the mask that the purge then deletes, and the two
-# tasks report changed at each other forever.
-- name: Mask RaspAP daemon
-  ansible.builtin.systemd:
-    name: raspapd
-    state: stopped
-    enabled: false
-    masked: true
 # Separate, and allowed to fail, precisely because of the comment above: this
 # one is not already on the box, so it is the only apt task here that needs a
 # working uplink. A deploy at a venue with no internet must not die on it -
@@ -33,27 +19,7 @@
     state: present
   register: _conntrack_pkg
   failed_when: false
-  when: purge_raspap | bool and not (purge_raspap_packages | bool)
 
-- name: Stop and disable the RaspAP web UI
-  ansible.builtin.systemd:
-    name: lighttpd
-    state: stopped
-    enabled: false
-  failed_when: false
-  when: purge_raspap | bool
-
-# The sudoers drop-in outlives the daemon and is the real prize: it grants
-# www-data passwordless root to read wpa_supplicant.conf (the venue PSKs), to
-# overwrite hostapd.conf (the AP passphrase) and dhcpcd.conf (what rasputin
-# rewrites), and to drop new /etc/dnsmasq.d/090_*.conf fragments - re-entry
-# around both the blocklist and the DoH upstream. Removing a file cannot make
-# sudoers unparseable, so this needs no validate step.
-- name: Remove the RaspAP sudoers drop-in
-  ansible.builtin.file:
-    path: /etc/sudoers.d/090_raspap
-    state: absent
-  when: purge_raspap | bool
 - name: Warn if conntrack could not be installed
   ansible.builtin.debug:
     msg: "conntrack not installed - after an uplink renumbers, flows will hang until conntrack times them out"
@@ -75,74 +41,15 @@
     name: wpa_supplicant@wlan0
     enabled: true
 
-# NOT optional. The 090_* ones cannot coexist with ours - verified with
-# dnsmasq --test: 090_raspap.conf and 10-base.conf both set log-facility, which
-# dnsmasq rejects as "illegal repeated keyword", and 090_wlan1.conf duplicates
-# our wlan1 dhcp-range. Leaving them in place means dnsmasq refuses to start.
-# The 099-upstream pair is inert only because 10-base.conf sets port=0; drop
-# port=0 with those in place and dnsmasq resolves in plaintext to 1.1.1.1,
-# silently bypassing blocky and the DoH upstream. They go too.
-- name: Remove RaspAP dnsmasq fragments
-  ansible.builtin.file:
-    path: "/etc/dnsmasq.d/{{ item }}"
-    state: absent
-  loop:
-    - 090_raspap.conf
-    - 090_wlan0.conf   # should never have existed: wlan0 is always a client
-    - 090_wlan1.conf
-    - 090_eth0.conf
-    - 090_adblock.conf
-    - 099-upstream.conf
-    - 099-upstream.conf.orig
-  notify: restart dnsmasq
-
-# --- the half of RaspAP that listens ----------------------------------------
-# See purge_raspap_api in defaults for what these are. Masked rather than
-# disabled for the same reason raspapd is: a thing that runs at boot and
-# reconfigures the router must not be able to return by dependency. Nothing
-# depends on them - rasputin owns every knob they offer.
-#
-# Skipped once the unit files are gone, for the reason given at raspapd above.
-- name: Mask the RaspAP REST API and its network monitor
-  ansible.builtin.systemd:
-    name: "{{ item }}"
-    state: stopped
-    enabled: false
-    masked: true
-  failed_when: false
-  loop:
-    - restapi.service
-    - "raspap-network-activity@{{ wan_wifi_if }}.service"
-  when: purge_raspap_api | bool and not (purge_raspap_packages | bool)
-
-# The web UI's tail. php-fpm is the FastCGI backend for the UI that is already
-# disabled and it listens on a unix socket, not a port, so this is surface
-# rather than exposure. It goes because a daemon running for a service that no
-# longer exists is one more thing the next rebuild has to explain.
-- name: Stop the web stack's leftover daemons and timers
-  ansible.builtin.systemd:
-    name: "{{ item }}"
-    state: stopped
-    enabled: false
-  failed_when: false
-  loop:
-    - php8.4-fpm.service
-    - lighttpd-maint.timer
-    - phpsessionclean.timer
-    - openvpn.service   # the tunnel here is wireguard; this never ran
-  when: purge_raspap | bool
-
-# A SECOND set of base chains at the same hooks as inet rasputin, reloaded from
-# /etc/nftables.conf at every boot. The filter half is shadowed by rasputin's
-# drop policy - a drop at a hook beats an accept in another chain there - but
-# chain routethrough carries a standing `oifname eth0 masquerade` that nothing
-# sanctioned, and in uplink mode eth0 is the venue's leg. The role already
-# empties the iptables equivalent below; it never knew about the nft-native one.
+# nftables.service loads this at every boot, which makes it a second author of
+# the packet path beside table inet rasputin. It arrived carrying base chains at
+# the same hooks and a standing `oifname {{ eth_if }} masquerade` - in uplink
+# mode, a masquerade out the venue's leg that nothing sanctioned.
 #
 # Emptied, and deliberately NOT given a `flush ruleset`: nftables.service and
 # rasputin-converge have no ordering between them, so a flush here would wipe
 # the live table on whichever boot it happened to run second.
-- name: Stop nftables.conf restoring RaspAP's second table
+- name: Keep /etc/nftables.conf inert
   ansible.builtin.copy:
     dest: /etc/nftables.conf
     mode: "0644"
@@ -152,123 +59,6 @@
       # Managed by rasputin. The live ruleset is table inet rasputin, written by
       # rasputin at every converge and rebuilt at boot. Nothing else claims a
       # hook here - no flush on purpose, see the role task.
-  when: purge_raspap | bool
-
-# --- what masking left behind ------------------------------------------------
-# See purge_raspap_packages. Ordered removal-last: the units are already masked
-# and the daemons already stopped, so nothing here is taking a running service
-# away from the box.
-- name: Remove the RaspAP web stack
-  ansible.builtin.apt:
-    name:
-      - lighttpd
-      - lighttpd-mod-deflate
-      - lighttpd-mod-openssl
-      - php8.4-fpm
-      - php8.4-cli
-      - php8.4-common
-      - php8.4-opcache
-      - php8.4-readline
-      - php-common
-      - openvpn          # the tunnel here is wireguard; this never ran
-      - vnstat           # RaspAP's bandwidth graphs; the status panel reads /proc/net/dev
-    state: absent
-    purge: true
-    autoremove: true
-  when: purge_raspap_packages | bool
-
-# Globbed rather than listed: the installer leaves a dated copy of both trees
-# each time it runs - three under /etc, four web roots - so the set grows and
-# naming them individually goes stale. /etc/lighttpd goes too: purging the
-# package takes its own conffiles, but 50-raspap-router.conf was dropped in by
-# the installer, so dpkg does not know it is there.
-- name: Find every RaspAP config tree and web root
-  ansible.builtin.find:
-    paths: "{{ item.path }}"
-    patterns: "{{ item.pattern }}"
-    file_type: any
-    depth: 1
-  loop:
-    - { path: /etc, pattern: "raspap*" }
-    - { path: /var/www, pattern: "htm*" }
-  register: _raspap_trees
-  when: purge_raspap_packages | bool
-
-- name: Remove the RaspAP config trees and web roots
-  ansible.builtin.file:
-    path: "{{ item }}"
-    state: absent
-  loop: >-
-    {{ (_raspap_trees.results | default([]) | map(attribute='files', default=[])
-        | flatten | map(attribute='path') | list) + ['/etc/lighttpd'] }}
-  when: purge_raspap_packages | bool
-
-# RaspAP installs by shell script, so apt has no record of these units or the
-# binaries they run. The masks in /etc go with them - a mask pointing at a unit
-# file that no longer exists is a tombstone, not a guard.
-#
-# routing.service is the one worth removing on its own merits. It is a disabled
-# oneshot that writes /etc/nftables.conf from a heredoc - RaspAP's own AP
-# masquerade, table inet ap - and then enables nftables. One systemctl enable,
-# or one dependency picking it up, and it replaces the live ruleset this role
-# manages. Disabled is not the same as harmless.
-- name: Remove the orphaned RaspAP units and the binaries they run
-  ansible.builtin.file:
-    path: "{{ item }}"
-    state: absent
-  loop:
-    - /lib/systemd/system/raspapd.service
-    - /lib/systemd/system/restapi.service
-    - /lib/systemd/system/raspap-network-activity@.service
-    - /etc/systemd/system/raspapd.service
-    - /etc/systemd/system/restapi.service
-    - "/etc/systemd/system/raspap-network-activity@{{ wan_wifi_if }}.service"
-    - /etc/systemd/system/routing.service
-    - /usr/local/bin/raspap-network-monitor
-    - /usr/local/bin/raspap-routing.sh
-    # The enablement links, which nothing else removes: systemctl enable wrote
-    # them, so dpkg does not own them and purging the package leaves them
-    # behind. A .wants link to a unit file that is gone is not inert - boot
-    # still tries to pull the unit in and fails. openvpn-client@client is here
-    # for the same reason the package is: RaspAP enabled it, it never ran.
-    - /etc/systemd/system/multi-user.target.wants/raspapd.service
-    - /etc/systemd/system/multi-user.target.wants/restapi.service
-    - "/etc/systemd/system/multi-user.target.wants/raspap-network-activity@{{ wan_wifi_if }}.service"
-    - /etc/systemd/system/multi-user.target.wants/openvpn-client@client.service
-    # A bridge named br0 with eth0 as its member. systemd-networkd is disabled
-    # here so neither file does anything today, and br0 does not exist - but
-    # enabling networkd would silently enslave the LAN leg into a bridge this
-    # role does not know about. Same shape as routing.service: inert until
-    # something turns its engine on.
-    - /etc/systemd/network/raspap-bridge-br0.netdev
-    - /etc/systemd/network/raspap-br0-member-eth0.network
-  register: _raspap_units
-  when: purge_raspap_packages | bool
-
-- name: Reload systemd after removing units
-  ansible.builtin.systemd:
-    daemon_reload: true
-  when: _raspap_units.changed | default(false)
-
-# --- the last author of table ip nat ----------------------------------------
-# See purge_iptables_persistent. The live table survives until the next boot -
-# nothing here flushes it, because a flush races rasputin for the ruleset. It
-# goes by not being restored, which is also what proves this worked.
-- name: Remove the iptables persistence layer
-  ansible.builtin.apt:
-    name:
-      - iptables-persistent
-      - netfilter-persistent
-    state: absent
-    purge: true
-    autoremove: true
-  when: purge_iptables_persistent | bool
-
-- name: Remove the saved iptables rules
-  ansible.builtin.file:
-    path: /etc/iptables
-    state: absent
-  when: purge_iptables_persistent | bool
 
 # --- the minute the boot spends waiting -------------------------------------
 # See disable_nm_wait_online. Masked rather than disabled: network-online.target
@@ -384,116 +174,6 @@
       Signed-By: /usr/share/keyrings/debian-archive-keyring.pgp
   when: manage_apt_sources | bool
 
-- name: Remove the hand edit left beside it
-  ansible.builtin.file:
-    path: /etc/apt/sources.list.d/debian.sources.bak
-    state: absent
-  when: manage_apt_sources | bool
-
-# --- back to basics ----------------------------------------------------------
-# See strip_to_basics. Everything here arrived with the SD card image and none
-# of it has a job on a router. avahi is deliberately NOT in the list: rasputin
-# references it six times, silencing it per-interface, so removing it would
-# break the converge.
-- name: Remove what the image brought and this router does not use
-  ansible.builtin.apt:
-    name:
-      - docker-ce
-      - docker-ce-cli
-      - docker-ce-rootless-extras
-      - docker-buildx-plugin
-      - docker-compose-plugin
-      - docker-model-plugin
-      - containerd.io
-      - locales-all      # 231MB of locales on a headless box
-      - cloud-init       # five units and a boot delay, on a box this role declares whole
-      - bluez
-      - modemmanager     # the uplink is wifi to a hotspot; there is no modem
-      - udisks2
-      - pcscd            # smartcard daemon
-      - build-essential  # no dkms here, so nothing compiles anything
-    state: absent
-    purge: true
-    autoremove: true
-  when: strip_to_basics | bool
-
-# Queried rather than listed: these package names carry the kernel version, so
-# a hardcoded list goes stale on the next kernel upgrade - and one is queued.
-- name: Find the installed kernel build trees
-  ansible.builtin.shell:
-    cmd: dpkg-query -W -f='${Package}\n' 'linux-headers-*' 'linux-kbuild-*' 2>/dev/null || true
-  register: _kbuild
-  changed_when: false
-  when: strip_to_basics | bool
-
-- name: Remove the kernel build trees
-  ansible.builtin.apt:
-    name: "{{ _kbuild.stdout_lines }}"
-    state: absent
-    purge: true
-    autoremove: true
-  when: strip_to_basics | bool and (_kbuild.stdout_lines | default([]) | length > 0)
-
-- name: Remove the Docker apt source and what cloud-init left
-  ansible.builtin.file:
-    path: "{{ item }}"
-    state: absent
-  loop:
-    - /etc/apt/sources.list.d/docker.list
-    - /etc/apt/keyrings/docker.asc
-    - /var/lib/cloud
-    - /etc/cloud
-    # The masks below outlive the units they masked - same tombstone problem as
-    # the RaspAP ones. Nothing removes them but this.
-    - /etc/systemd/system/docker.service
-    - /etc/systemd/system/docker.socket
-    - /etc/systemd/system/containerd.service
-  register: _strip_files
-  when: strip_to_basics | bool
-
-- name: Reload systemd after the strip
-  ansible.builtin.systemd:
-    daemon_reload: true
-  when: _strip_files.changed | default(false)
-
-# --- mce888 ------------------------------------------------------------------
-# Removed rather than stopped: the image is kept on the controller, so nothing
-# here is the last copy. The named volume is left alone - see purge_mce888.
-- name: Check whether Docker can still be talked to
-  ansible.builtin.stat:
-    path: /var/run/docker.sock
-  register: _docker_sock
-  when: purge_mce888 | bool
-
-# Gated on the socket because the Mask Docker task below takes it away: on every
-# run after the first, docker cannot connect, the removal fails, failed_when
-# swallows it and changed_when reports success anyway. Skipping says what is
-# true - there is no daemon to remove anything from - and the task still does
-# its job on a box that has not been converged yet.
-- name: Remove the mce888 container and image
-  ansible.builtin.command: "docker {{ item }}"
-  loop:
-    - rm --force mce888-sms
-    - image rm --force mce888-sms:latest
-  register: _mce888_rm
-  failed_when: false
-  changed_when: _mce888_rm.rc == 0
-  when: purge_mce888 | bool and (_docker_sock.stat.exists | default(false))
-
-# Masked, not merely stopped. Docker installs its own base chains and a bridge
-# at every start, and those chains are the one part of this box's packet path
-# that rasputin does not write - so leaving it able to start leaves a second
-# author of the ruleset.
-- name: Mask Docker
-  ansible.builtin.systemd:
-    name: "{{ item }}"
-    state: stopped
-    enabled: false
-    masked: true
-  failed_when: false
-  loop: [docker.service, docker.socket, containerd.service]
-  when: purge_mce888 | bool and not (strip_to_basics | bool)
-
 # The mce888 deploy key carried no from= or command= restriction on an account
 # with passwordless sudo, so a key minted to ship a container in another project
 # held full root here. It goes by not being listed, rather than by being matched
@@ -511,23 +191,10 @@
     quiet: true
 
 # --- the admin account ------------------------------------------------------
-# See admin_user. pi came with the SD card image and was never declared here,
-# which is why nothing creates it. This declares its replacement instead.
-#
-# The password is copied from the outgoing account rather than set from a
-# variable, so Max's existing password keeps working and no secret has to live
-# in the vault. Seeded on creation only - update_password: on_create means
-# changing it on the box afterwards sticks. Once the old account is gone this
-# whole seeding step no-ops, and a rebuild from bare metal needs the password
-# set by hand once.
-- name: Read the outgoing account's password hash
-  ansible.builtin.getent:
-    database: shadow
-    key: "{{ legacy_admin_user }}"
-  no_log: true
-  failed_when: false
-  when: admin_user != legacy_admin_user
-
+# See admin_user. The account the SD card image shipped with was never declared
+# here, which is why nothing creates it; this declares its replacement. A
+# rebuild from bare metal needs the password set by hand once - there is no
+# secret for it in the vault, on purpose.
 - name: Create the admin account
   ansible.builtin.user:
     name: "{{ admin_user }}"
@@ -535,8 +202,6 @@
     append: true
     shell: /bin/bash
     create_home: true
-    password: "{{ (ansible_facts.getent_shadow | default({}))[legacy_admin_user][0] | default(omit) }}"
-    update_password: on_create
   no_log: true
 
 - name: Give the admin account an ssh directory
@@ -560,36 +225,6 @@
       {{ key }}
       {% endfor %}
 
-# Came with the SD card image: `max ALL=(ALL) NOPASSWD: ALL` for an account
-# that did not exist on this box. Dormant only while nobody creates that user -
-# which is exactly what this role now does. The filename is a lie as well; it
-# is called 010_pi-nopasswd and grants pi nothing.
-- name: Remove the image's stray root grant
-  ansible.builtin.file:
-    path: /etc/sudoers.d/010_pi-nopasswd
-    state: absent
-
-# The one step in this role that cannot be walked back from the controller:
-# after it, the only way in is admin_user's key. Hence two gates - the flag,
-# turned on only once that login and its sudo have been proved by hand, and the
-# refusal to delete whichever account this run is connected as.
-- name: Remove the account the image shipped with
-  ansible.builtin.user:
-    name: "{{ legacy_admin_user }}"
-    state: absent
-    remove: true
-    force: true
-  when:
-    - remove_legacy_admin | bool
-    - admin_user != legacy_admin_user
-    - ansible_user != legacy_admin_user
-
-- name: Remove the mce888 environment file
-  ansible.builtin.file:
-    path: "/home/{{ legacy_admin_user }}/mce888-sms.env"
-    state: absent
-  when: purge_mce888 | bool
-
 # --- secrets the old stack left readable -------------------------------------
 # RaspAP-era ownership: the wireguard configs are www-data-owned and 0644, so
 # the tunnel's private key is readable by every account on the box. They are
@@ -612,17 +247,6 @@
   loop: "{{ _wg_confs.files }}"
   loop_control:
     label: "{{ item.path }}"
-
-# Old copies from when wlan0 was tried as the AP. Both are 0644 and both carry a
-# wpa_passphrase line, so they leak the passphrase that the live hostapd.conf is
-# careful to keep at 0600.
-- name: Remove the hostapd backups carrying the AP passphrase
-  ansible.builtin.file:
-    path: "/etc/hostapd/{{ item }}"
-    state: absent
-  loop:
-    - hostapd.conf.broken-5ghz
-    - hostapd.conf.wlan0-24
 
 # --- admin plane -------------------------------------------------------------
 # Why this is worth closing at all: see harden_ssh in defaults.
@@ -681,21 +305,6 @@
   loop:
     - /usr/local/share/rasputin
     - /etc/rasputin
-
-# --- the netmode rename -------------------------------------------------------
-# The declared profile lived in /etc/netmode/mode. It has to move BEFORE the
-# read below, not after: a missing file falls back to default_mode, which would
-# silently turn a declared 'home' into the raw seed and throw away the profile
-# name. force: false so it never overwrites a mode already declared under the
-# new path.
-- name: Carry the declared mode across from the old name
-  ansible.builtin.copy:
-    src: /etc/netmode/mode
-    dest: /etc/rasputin/mode
-    remote_src: true
-    force: false
-    mode: "0644"
-  failed_when: false
 
 # default_mode is only a SEED (written once, force:false). The authoritative
 # mode lives in /etc/rasputin/mode and diverges the moment you run `rasputin
@@ -785,30 +394,6 @@
   ansible.builtin.debug:
     msg: "ap_passphrase undefined - leaving /etc/hostapd/hostapd.conf alone. Vault it to manage the AP."
   when: ap_passphrase is not defined or ap_passphrase | length == 0
-
-# netfilter-persistent restores /etc/iptables/rules.v4 at every boot, which is
-# where RaspAP's blanket masquerade comes back from. NAT belongs to nftables
-# now, so the nat table is emptied. Docker adds its own rules at runtime and is
-# unaffected. The 192.168.50.0/24 rule referenced a subnet that does not exist.
-#
-# Skipped once purge_iptables_persistent has removed the restorer and the
-# directory this writes into: emptying a file nothing reads is at best a no-op,
-# and here it is an error, because the task would have to recreate /etc/iptables
-# to write it.
-- name: Stop netfilter-persistent restoring RaspAP's blanket NAT
-  ansible.builtin.copy:
-    dest: /etc/iptables/rules.v4
-    mode: "0644"
-    backup: true
-    content: |
-      # Managed by rasputin. NAT is owned by nftables (table inet rasputin).
-      *nat
-      :PREROUTING ACCEPT [0:0]
-      :INPUT ACCEPT [0:0]
-      :OUTPUT ACCEPT [0:0]
-      :POSTROUTING ACCEPT [0:0]
-      COMMIT
-  when: not (purge_iptables_persistent | bool)
 
 # wlan0 presents a fresh MAC to each SSID, and a random one while merely
 # scanning - otherwise the real MAC is broadcast before you ever associate.
@@ -975,36 +560,6 @@
       [Install]
       WantedBy=multi-user.target
   notify: reload systemd
-
-# The enable symlink goes with the unit file. Removing the unit alone leaves a
-# .wants link pointing at nothing, and boot still tries to pull it in - the
-# exact failure this repo hit purging RaspAP.
-- name: Remove the artefacts of the old name
-  ansible.builtin.file:
-    path: "{{ item }}"
-    state: absent
-  loop:
-    - /usr/local/sbin/netmode
-    - /usr/local/share/netmode
-    - /etc/netmode
-    - /etc/systemd/system/netmode-converge.service
-    - /etc/systemd/system/multi-user.target.wants/netmode-converge.service
-  register: _old_name
-  notify: reload systemd
-
-# Only once the new table is actually up. Deleting the old one first would
-# leave the box with no ruleset at all until the next converge; deleting it
-# after means the two coexist for a moment, which is the safer half-second.
-# If the new table is not up yet the reboot handles it - nftables.conf declares
-# no tables, so nothing recreates inet netmode.
-- name: Drop the pre-rename firewall table
-  ansible.builtin.shell:
-    cmd: |
-      nft list table inet rasputin >/dev/null 2>&1 || exit 0
-      nft list table inet netmode  >/dev/null 2>&1 || exit 0
-      nft delete table inet netmode && echo removed
-  register: _old_table
-  changed_when: "'removed' in _old_table.stdout"
 
 - name: Seed the declared mode if unset
   ansible.builtin.copy:

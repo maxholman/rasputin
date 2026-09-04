@@ -37,34 +37,6 @@ admin_on_uplink: false
 # Set false for the first run on a box you cannot physically reach.
 converge_on_deploy: true
 
-# RaspAP removal. Its daemon runs at every boot and disables systemd-networkd,
-# and its sudoers drop-in gives www-data passwordless root over wpa_supplicant,
-# hostapd.conf, dhcpcd.conf and /etc/dnsmasq.d/090_*.conf - a standing re-entry
-# route around the blocklist and the DoH upstream. Nothing here depends on it.
-purge_raspap: true
-
-# purge_raspap only ever masked and disabled - it neutered RaspAP, it never
-# removed it. This is the removal: the packages, /etc/raspap and its dated
-# backups, the four web roots, and the units and binaries left behind by an
-# installer that was a shell script rather than a package, so apt does not know
-# about them. One of those units, routing.service, would overwrite
-# /etc/nftables.conf with RaspAP's own ruleset if anything ever enabled it.
-#
-# hostapd and dnsmasq are deliberately NOT in the list: they are the AP and the
-# DHCP server, not RaspAP's.
-purge_raspap_packages: true
-
-# The persistence layer, not iptables itself. netfilter-persistent restores
-# /etc/iptables/rules.v4 at every boot, and that is the only thing still
-# creating table ip nat - a second author of the packet path beside table inet
-# rasputin. The rules file is already empty of rules, so this removes the
-# mechanism rather than any filtering.
-#
-# The iptables package STAYS. network-manager and docker-ce both depend on it,
-# so purging it would take NetworkManager - which owns eth0 - with it. That is
-# a far larger change than this one, and not one to make as a side effect.
-purge_iptables_persistent: true
-
 # One failing unit costs this box most of its boot. NetworkManager-wait-online
 # waits 60s for a managed connection that never comes - NM holds only lo and
 # eth0 here, and eth0 it did not bring up - then fails. network-online.target
@@ -76,55 +48,21 @@ purge_iptables_persistent: true
 # so it copes with its addresses arriving after it starts.
 disable_nm_wait_online: true
 
-# Separate from purge_raspap because it removes a different kind of thing: the
-# half of RaspAP that listens. restapi.service is a uvicorn app on 0.0.0.0:8081
-# whose endpoints shell out, read /etc/wireguard and return the AP passphrase in
-# plaintext. Its whole gate is one static header key, and the code falls back to
-# the literal string "insecure" when the env var is missing.
-purge_raspap_api: true
-
-# mce888 arrived with the SD card image, not with this router - the card is a
-# clone of that project's box. Removing it takes Docker with it; nothing else
-# here uses containers. The named volume is deliberately NOT removed: it is the
-# workload's only state, and it costs nothing to leave until the rebuild.
-purge_mce888: true
-
 # The apt sources, declared. Upgrading is NOT done by this role - a converge
 # that silently upgraded the box would be a converge you could not predict -
 # but which mirrors it would upgrade FROM is configuration, and belongs here.
 manage_apt_sources: true
 debian_suite: trixie
 
-# Back to basics: what the SD card image dumped on the box that a router has no
-# use for. The container stack (nothing runs in it, and /var/lib/docker is
-# empty), 231MB of locales on a headless box, cloud-init on a box this role
-# declares whole, Bluetooth, the mobile-modem daemon, the disk-mounting daemon,
-# the smartcard daemon, and the compiler and kernel headers - there is no dkms
-# here, so nothing builds a module.
-#
-# NOT included, on purpose: avahi, which rasputin silences per-interface and so
-# depends on; NetworkManager, which a fresh install ships anyway and which
-# iptables depends on; and dhcpcd, whose config rasputin rewrites.
-strip_to_basics: true
-
-# Who administers this box. pi came with the SD card image and was never
-# declared anywhere - the role simply assumed whatever it connected as. The
-# image also came from a machine where the user was called max, which is why
-# pi's primary group is `max` and why a sudoers file granting max full root
-# was sitting there waiting for the account to exist.
+# Who administers this box. The SD card image's own account was never declared
+# anywhere - the role simply assumed whatever it connected as - so this declares
+# the account instead of inheriting one.
 admin_user: max
-legacy_admin_user: pi
 
 # append: true, so this adds to whatever primary group the account has rather
 # than replacing it. sudo is the one that matters; the rest are the hardware
 # groups the image gave pi, kept so the new account can reach the same devices.
 admin_groups: [sudo, adm, dialout, video, plugdev, input, netdev, spi, i2c, gpio]
-
-# The point of no return, so it is off by default. Turn it on only once
-# admin_user has been proved to log in by key AND run sudo, on a real login -
-# not inferred from a successful ansible run, which proves the old account
-# still works rather than the new one. See the task for the second gate.
-remove_legacy_admin: true
 
 # SSH. Key auth is already how every path into this box works, so the password
 # path is a second way in that nothing depends on. It matters more than it looks

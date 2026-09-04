@@ -82,42 +82,18 @@ rollback window. Only appropriate once the ruleset is known good.
 | flag | default | effect |
 |---|---|---|
 | `converge_on_deploy` | `true` | apply mode+firewall at the end of the run |
-| `purge_raspap` | `true` | mask `raspapd`, disable the `lighttpd` web UI, remove the RaspAP sudoers drop-in |
 
-RaspAP's **dnsmasq fragments are always removed**, regardless of `purge_raspap`
-— they are not optional. Verified with `dnsmasq --test`: `090_raspap.conf` and
-our `10-base.conf` both set `log-facility`, which dnsmasq rejects outright as
-`illegal repeated keyword`, and `090_wlan1.conf` duplicates our `wlan1`
-dhcp-range. Left in place, dnsmasq refuses to start at all. `090_adblock.conf`
-and the `099-upstream.conf` pair don't conflict, but they are inert *only*
-because `10-base.conf` sets `port=0` — drop `port=0` with `099-upstream.conf`
-present and dnsmasq resolves in plaintext to `1.1.1.1`, bypassing blocky, the
-blocklist and the DoH upstream in one step. They are removed too.
+RaspAP and mce888 are gone from this box, and their removal tasks are gone from
+the role. A task that purges something already purged asserts nothing: it is a
+no-op that still has to be read, understood and skipped on every run, and it
+describes a machine that no longer exists. Git history holds the detail if a
+rebuild ever needs it.
 
-`purge_raspap` defaults to **true** and does three things worth spelling out:
-
-- **`raspapd` is masked, not merely disabled.** It is a oneshot that runs at
-  every boot, and its job includes `Disabling systemd-networkd` — it would
-  silently undo the networkd migration on the next reboot.
-- **`lighttpd` is stopped and disabled.** It was listening on `0.0.0.0:80`.
-  rasputin's input chain never accepted `:80` on any interface, so it was not
-  reachable off-box, but it is the process that writes the fragments above.
-- **`/etc/sudoers.d/090_raspap` is removed.** It granted `www-data` passwordless
-  root to `cat` `wpa_supplicant.conf` (every venue PSK), overwrite
-  `hostapd.conf` (the AP passphrase) and `dhcpcd.conf` (what rasputin rewrites),
-  install `/etc/dnsmasq.d/090_*.conf`, and `reboot`. Because `/etc/raspap` is
-  `www-data`-owned, and rename permission comes from the parent directory,
-  `www-data` could also swap the root-owned `hostapd/` subdirectory and have
-  `sudo /etc/raspap/hostapd/servicestart.sh` execute its own script as root.
-
-The `/etc/raspap*` trees themselves are left on disk — inert once the sudoers
-rule and both services are gone.
-
-The purge exposed a hidden boot dependency, found the hard way: raspapd's boot
-job was the only thing starting `wpa_supplicant` on wlan0, so the first reboot
-after masking it came up with the AP beaconing and a **dead WAN**. The role now
-enables `wpa_supplicant@wlan0.service` (config symlinked to
-`wpa_supplicant-wlan0.conf`) as the boot-time owner of the WAN association.
+One thing they left behind is load-bearing and stays. raspapd's boot job was,
+undocumented, the only thing starting `wpa_supplicant` on wlan0 — the first
+reboot after masking it came up with the AP beaconing and a **dead WAN**. The
+role enables `wpa_supplicant@wlan0.service` (config symlinked to
+`wpa_supplicant-wlan0.conf`) as the boot-time owner of that association.
 
 `ap_passphrase` is undefined on purpose, so `hostapd.conf` is left alone and
 your AP keeps its current config and clients. Vault it to manage the AP:
@@ -564,5 +540,5 @@ they are stated loudly rather than quietly. Needs sudo on the Pi; it prompts, or
   The sed surgery on dhcpcd.conf is a real wart, but it is debugged and the
   whole stack - kill switch, DoH, MAC randomisation on brcmfmac - was proven
   on hardware with dhcpcd in place; migrating live re-opens all of that for
-  zero functional gain. raspapd is masked, so nothing disables networkd at
-  boot anymore when the time comes.
+  zero functional gain. raspapd was what used to disable networkd at boot, and
+  it is off the box entirely, so nothing stands in the way when the time comes.
