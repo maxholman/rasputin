@@ -420,9 +420,25 @@ set_wpa_randomisation() {
 # after it holds that MAC until `rasputin mac-new` releases it. With no pin
 # this is the old behaviour exactly: arriving somewhere is when a new identity
 # is wanted, and every converge takes one.
+# A pin is an identity some venue's portal authorised, and it must not outlive
+# that venue: worn into the next one it links the two together, which is the
+# correlation the randomisation exists to prevent. The SSID it was taken on is
+# recorded beside it and checked here, while the supplicant is still running -
+# apply_uplink_mac runs with it stopped and cannot ask.
+drop_stale_mac_pin() {
+  local p_if p_mac p_ssid now
+  [[ -f $MAC_PIN ]] || return 0
+  read -r p_if p_mac p_ssid < "$MAC_PIN" || return 0
+  [[ $p_if == "$WIFI" && -n $p_ssid && $p_ssid != "-" ]] || return 0
+  now=$(wpa_cli -i "$WIFI" status 2>/dev/null | sed -n 's/^ssid=//p') || true
+  [[ -n $now && $now != "$p_ssid" ]] || return 0
+  rm -f "$MAC_PIN"
+  echo "rasputin: dropped the MAC pinned on \"$p_ssid\" - this is \"$now\", a different network"
+}
+
 apply_uplink_mac() {
-  local ifc="$1" p_if p_mac
-  if [[ -f $MAC_PIN ]] && read -r p_if p_mac < "$MAC_PIN" && [[ $p_if == "$ifc" ]]; then
+  local ifc="$1" p_if p_mac p_ssid
+  if [[ -f $MAC_PIN ]] && read -r p_if p_mac p_ssid < "$MAC_PIN" && [[ $p_if == "$ifc" ]]; then
     # Must happen before reassociate_wifi restarts the supplicant, or the
     # supplicant re-randomises and the pin is silently discarded.
     [[ $ifc == "$WIFI" ]] && set_wpa_randomisation 0
@@ -436,10 +452,36 @@ apply_uplink_mac() {
   randomize_mac "$ifc"
 }
 
+# wlan0's randomisation is undone by the AP beside it: hostapd has no bssid=
+# line, so it beacons from wlan1's hardware address, and a controller that logs
+# neighbouring BSSIDs sees the same one at every venue - next to a client MAC
+# that changes, which is worse than not randomising, because it links them.
+#
+# Before hostapd rather than in converge: converge runs long after the AP is
+# up, and changing the address underneath it would drop every client. Saved
+# networks key on SSID, so a new BSSID at boot costs one reconnect, which is
+# also what a reboot costs anyway.
+ap_mac_new() {
+{% if randomize_ap_mac | default(true) | bool %}
+  # Never fatal. This runs Before=hostapd.service, and an AP that does not come
+  # up is the one failure with no way back in - a predictable address is the
+  # lesser problem by a wide margin.
+  randomize_mac "$AP" || true
+{% else %}
+  :
+{% endif %}
+}
+
 pin_uplink_mac() {
-  local ifc="$1" mac
+  local ifc="$1" mac ssid="-"
   mac=$(cat "/sys/class/net/$ifc/address" 2>/dev/null) || return 0
-  echo "$ifc $mac" > "$MAC_PIN"
+  # Recorded so the pin can be recognised as belonging to somewhere else later.
+  # The SSID goes last because it may contain spaces.
+  if [[ $ifc == "$WIFI" ]]; then
+    ssid=$(wpa_cli -i "$WIFI" status 2>/dev/null | sed -n 's/^ssid=//p') || true
+    [[ -n $ssid ]] || ssid="-"
+  fi
+  echo "$ifc $mac $ssid" > "$MAC_PIN"
   echo "rasputin: $ifc MAC $mac pinned - 'rasputin mac-new' takes a fresh one"
 }
 
@@ -574,6 +616,12 @@ join_network() {
   } >> "$tmp"
 
   chmod 0600 "$tmp"; mv -f "$tmp" "$WPA_CONF"
+  # Joining somewhere is arriving somewhere, and the pinned identity belongs to
+  # wherever we were before.
+  if [[ -f $MAC_PIN ]]; then
+    rm -f "$MAC_PIN"
+    echo "rasputin: dropped the pinned MAC - a new network gets a new identity"
+  fi
   echo "rasputin: wrote network block for \"$ssid\" ($kind, priority $priority)"
   wpa_apply "$ssid"
 }
@@ -993,6 +1041,7 @@ converge() {
 
   write_blocky_listen "$mode"
   write_avahi_deny "$mode"
+  drop_stale_mac_pin
 
 {% if randomize_client_mac | default(true) | bool %}
   # Whichever leg faces the venue gets a fresh identity on every converge -
@@ -1284,6 +1333,7 @@ case "$cmd" in
   portal-expire)
     echo "rasputin: portal window expired - restoring '$(cat "$STATE" 2>/dev/null || echo '?')'" >&2
     portal_close; converge ;;
+  ap-mac)   ap_mac_new ;;
   mac-new)  rm -f "$MAC_PIN"; echo "rasputin: MAC pin dropped - this converge takes a fresh identity"; converge ;;
   confirm)  cancel_rollback ;;
   rollback-fire) rollback_fire ;;

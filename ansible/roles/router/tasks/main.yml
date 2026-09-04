@@ -334,6 +334,89 @@
     dest: /usr/local/bin/rasputin
     state: link
 
+# nftables.service ships ExecStop=nft flush ruleset, and it is enabled. Any
+# restart of it - which `apt upgrade` performs whenever the nftables package
+# moves - flushes table inet rasputin along with everything else: no
+# masquerade, no input filtering, no marker, no warning, until the next
+# converge or uplink renumber happens to rebuild it. An empty ExecStop= clears
+# the inherited one without masking the unit, which still has to be able to
+# load /etc/nftables.conf (deliberately inert, see above).
+- name: Give nftables.service somewhere to put its shutdown flush
+  ansible.builtin.file:
+    path: /etc/systemd/system/nftables.service.d
+    state: directory
+    mode: "0755"
+
+- name: Stop nftables.service flushing rasputin's ruleset on restart
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/nftables.service.d/10-no-flush.conf
+    mode: "0644"
+    content: |
+      # Managed by rasputin.
+      [Service]
+      ExecStop=
+  notify: reload systemd
+
+# blocky binds DoH on the LAN addresses at startup, and dhcpcd has not always
+# assigned them by then - hostapd raises wlan1's carrier concurrently, so
+# 10.9.141.1 may not exist yet. The unit's Restart= eventually wins, at the
+# cost of failed binds and a window with no DNS on every boot; with eth0
+# unplugged in serve mode 10.6.141.1 never arrives and it never converges.
+#
+# Binding an address the box does not hold yet is exactly what this sysctl is
+# for. It removes the race rather than racing better, and it needs no ordering
+# against converge - which could not be expressed anyway, since converge
+# restarts blocky itself and the dependency would deadlock.
+- name: Let blocky bind LAN addresses before dhcpcd assigns them
+  ansible.builtin.copy:
+    dest: /etc/sysctl.d/30-rasputin-bind.conf
+    mode: "0644"
+    content: |
+      # Managed by rasputin.
+      net.ipv4.ip_nonlocal_bind=1
+  notify: reload sysctl
+
+# RaspAP left forwarding on at boot, which converge would set anyway - but
+# converge sets it alongside a ruleset, and this sets it alone. Before the
+# first converge, or after one that died, the difference is a box that forwards
+# the LAN out of a venue's leg with no NAT and no filtering rather than one
+# that simply does not forward.
+- name: Stop forwarding before there is a firewall to forward through
+  ansible.builtin.file:
+    path: /etc/sysctl.d/90_raspap.conf
+    state: absent
+  notify: reload sysctl
+
+# ExecStart is prefixed "-" and nothing Requires= this unit: if it fails, boot
+# carries on and hostapd comes up on the hardware address. An AP that does not
+# start is unrecoverable without a keyboard, and no privacy gain is worth it.
+- name: Randomise the AP's BSSID before hostapd claims it
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/rasputin-ap-mac.service
+    mode: "0644"
+    content: |
+      # Managed by rasputin.
+      [Unit]
+      Description=Give the access point a fresh BSSID
+      Before=hostapd.service
+      After=network-pre.target
+      Wants=network-pre.target
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=-/usr/local/sbin/rasputin ap-mac
+
+      [Install]
+      WantedBy=multi-user.target
+  notify: reload systemd
+
+- name: Enable the AP BSSID randomiser
+  ansible.builtin.systemd:
+    name: rasputin-ap-mac.service
+    enabled: "{{ randomize_ap_mac | default(true) | bool }}"
+    daemon_reload: true
+
 # --- config ----------------------------------------------------------------
 - name: Create rasputin directories
   ansible.builtin.file:

@@ -93,6 +93,12 @@ admin_ssh_keys:
 # auth or hands you a MAC reservation you need.
 randomize_client_mac: true
 
+# The AP's own BSSID, randomised at boot before hostapd claims the interface.
+# A fixed BSSID beside a randomised client MAC is worse than randomising
+# neither: it identifies this box at every venue AND ties the changing client
+# address to it, which is the correlation the client randomisation is buying.
+randomize_ap_mac: true
+
 # ---------------------------------------------------------------------------
 # Venue profiles. One word sets WAN leg + VPN state + DNS upstream together,
 # because setting them independently at midnight in a hotel is how you get it

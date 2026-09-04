@@ -98,3 +98,9 @@
 - name: restart journald
   ansible.builtin.shell: systemctl restart systemd-journald && journalctl --flush
   changed_when: true
+
+# --system, so the drop-in ordering is the one the box uses at boot rather than
+# whatever a single -p would impose.
+- name: reload sysctl
+  ansible.builtin.command: sysctl --system
+  changed_when: true
