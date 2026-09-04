@@ -20,8 +20,8 @@ upstreams:
 {% for u in blocky_upstreams %}
       - {{ u }}
 {% endfor %}
-  # strict, not parallel_best: the first upstream is chosen for doing its own
-  # malware filtering, and racing it against one that doesn't would let the
-  # loser answer for domains the winner blocks.
-  strategy: strict
+  # Safe to race only because every upstream in the group filters malware. Put
+  # a resolver that doesn't in blocky_upstreams and it can win for a domain the
+  # others block.
+  strategy: {{ blocky_upstream_strategy }}
   timeout: {{ blocky_upstream_timeout }}

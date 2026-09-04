@@ -601,7 +601,7 @@ write_blocky_upstream() {
       echo "      - {{ u }}"
 {% endfor %}
     fi
-    echo "  strategy: strict"
+    echo "  strategy: {{ blocky_upstream_strategy }}"
     echo "  timeout: {{ blocky_upstream_timeout }}"
   } > "$BLOCKY_UPSTREAM"
 }

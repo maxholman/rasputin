@@ -187,19 +187,31 @@ blocky_user: blocky
 blocky_version: v0.34.0
 blocky_sha256: 1a07aa52b127d75d15584706c76843b9fa3706be133b0d7b96b2ca65ba4f561f
 
-# Quad9 first: it filters known-malicious domains at the resolver, which is a
-# second opinion on the denylist below rather than a duplicate of it. Given by
-# HOSTNAME because Quad9's certificate has no IP SANs - see blocky_bootstrap.
-# Cloudflare is the fallback for venues that block Quad9. It does NO malware
-# filtering, so in that state the denylist is the only layer left.
+# Every upstream here filters known-malicious domains at the resolver, which is
+# a second opinion on the denylist below rather than a duplicate of it. That
+# uniformity is what blocky_upstream_strategy depends on: 1.1.1.1 was the
+# fallback and does NO filtering, so racing it could have answered for a domain
+# Quad9 refuses. 1.1.1.2/1.0.0.2 are Cloudflare's malware-blocking pair and do.
+#
+# Quad9 is given by HOSTNAME because its certificate has no IP SANs - see
+# blocky_bootstrap. The Cloudflare pair is given by IP, which their certificate
+# supports: CN=security.cloudflare-dns.com carries IP SANs for both.
 blocky_upstreams:
   - https://dns.quad9.net/dns-query
-  - https://1.1.1.1/dns-query
+  - https://1.1.1.2/dns-query
+  - https://1.0.0.2/dns-query
+
+# strict asks the first upstream and only falls to the next when it fails, so a
+# lossy uplink pays blocky_upstream_timeout in full before anything else is
+# tried - and a client that gives up at 5s never sees the second answer. Racing
+# two of them costs one extra query and removes that cliff. Safe only while
+# every member of the group filters; see the note above before adding one.
+blocky_upstream_strategy: parallel_best
 
 # Bootstraps the hostname above. Must be an IP-addressed DoH endpoint or we
-# would need a plaintext query to get started; 1.1.1.1's certificate carries
-# IP SANs for exactly this.
-blocky_bootstrap: https://1.1.1.1/dns-query
+# would need a plaintext query to get started; the Cloudflare certificate
+# carries IP SANs for exactly this.
+blocky_bootstrap: https://1.1.1.2/dns-query
 blocky_upstream_timeout: 3s
 
 # Security only. Ads and trackers are handled on-device; adult and gambling
