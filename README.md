@@ -61,10 +61,10 @@ firewall up behind a rollback window:
     ansible-playbook site.yml --ask-become-pass -e converge_on_deploy=false
 
     # 2. apply mode + firewall, auto-reverting in 5 minutes
-    ssh -t pi@10.6.141.1 'sudo rasputin serve --rollback 300'
+    ssh -t max@10.6.141.1 'sudo rasputin serve --rollback 300'
 
     # 3. from a NEW terminal - prove you can still get in, then keep it
-    ssh -t pi@10.6.141.1 'sudo rasputin confirm'
+    ssh -t max@10.6.141.1 'sudo rasputin confirm'
 
 Step 3 must be a **new** session. `ct state established` keeps an existing
 connection alive straight through a broken ruleset, so confirming from the
