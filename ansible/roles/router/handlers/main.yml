@@ -38,7 +38,11 @@
 # unaffected because it does not traverse wlan0.
 - name: restart wpa_supplicant
   ansible.builtin.systemd:
-    name: wpa_supplicant
+    # The INSTANCE unit. Plain wpa_supplicant.service on this image is the
+    # D-Bus daemon and restarting it does not touch {{ wan_wifi_if }} at all,
+    # so the seeded MAC keys reached the running supplicant only by way of a
+    # later converge.
+    name: "wpa_supplicant@{{ wan_wifi_if }}"
     state: restarted
 
 # blocky DOES have an offline config test, so it gets guard rail #1 rather than

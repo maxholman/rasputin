@@ -296,6 +296,44 @@
       # Managed by rasputin.
       {{ admin_user }} ALL=(root) NOPASSWD: /usr/local/sbin/rasputin-facts
 
+# Only the verbs needed at a venue you cannot yet reach the internet from.
+# The password is not a formality here: {{ admin_user }} holds an ssh key, and
+# without a prompt anything holding that key - a forwarded agent, a script
+# running in that shell - could drop the protections this box exists to
+# provide. rollback-fire deletes the ruleset outright, portal takes the tunnel
+# down and puts DNS in clear, and a profile switch turns the kill switch off:
+# those keep their prompt. join and forget only steer the uplink, which
+# {{ admin_user }} can already do - being in netdev reaches the supplicant's
+# control socket with no sudo at all.
+#
+# Getting a pattern wrong here fails CLOSED: an unmatched command falls back to
+# asking for the password. Nor can one widen to another verb, because the word
+# after the path is a literal.
+- name: Let the admin join a venue network without a password
+  ansible.builtin.copy:
+    dest: /etc/sudoers.d/21-rasputin
+    owner: root
+    group: root
+    mode: "0440"
+    validate: /usr/sbin/visudo -cf %s
+    content: |
+      # Managed by rasputin.
+      {{ admin_user }} ALL=(root) NOPASSWD: /usr/local/sbin/rasputin join, /usr/local/sbin/rasputin join *
+      {{ admin_user }} ALL=(root) NOPASSWD: /usr/local/sbin/rasputin forget, /usr/local/sbin/rasputin forget *
+
+# Which spelling of `rasputin` a shell finds depends on the shell, and the two
+# disagree: a login shell searches /usr/local/sbin FIRST, while `ssh host cmd`
+# carries no sbin directory at all. Measured on this box, not assumed. A second
+# script on /usr/local/bin would therefore be reached from one and bypassed by
+# the other. A symlink to the same file is reached either way, and rasputin
+# itself re-enters through sudo when it is not already root - so both spellings
+# work and one sudoers rule still governs one path.
+- name: Put rasputin within reach of a non-login PATH
+  ansible.builtin.file:
+    src: /usr/local/sbin/rasputin
+    dest: /usr/local/bin/rasputin
+    state: link
+
 # --- config ----------------------------------------------------------------
 - name: Create rasputin directories
   ansible.builtin.file:
@@ -435,6 +473,31 @@
 
 # Stop announcing ourselves to every venue's DHCP server. `hostname` sends
 # the literal string "raspberrypi" to every network we join.
+# rasputin's fence is supposed to be the only author of interface config, and
+# it is not: the SD card image's own stanzas sit above it, and so does a fence
+# from before the netmode rename. Three `interface eth0` blocks were live on
+# this box, and write_dhcpcd_block only ever rewrites its own - so declaring
+# uplink mode left eth0 pinned static by the other two and dhcpcd never asked
+# for a lease. hotel-eth could not take a venue address at all.
+#
+# Safe to delete outright rather than merge: every interface the legacy stanzas
+# declare, the fence declares too. The one line not carried over is wlan1's
+# `static domain_name_servers=1.1.1.1 8.8.8.8`, which is the point - this box
+# resolves through blocky, not past it.
+- name: Drop the pre-rename dhcpcd fence
+  ansible.builtin.replace:
+    path: /etc/dhcpcd.conf
+    regexp: '(?s)^# >>> netmode managed >>>.*?^# <<< netmode managed <<<\n'
+    replace: ''
+    backup: true
+
+- name: Leave rasputin the only author of dhcpcd interface config
+  ansible.builtin.replace:
+    path: /etc/dhcpcd.conf
+    regexp: '^# RaspAP (wlan0|eth0|wlan1) configuration\n(interface \w+\n([a-z].*\n)*)?\n?'
+    replace: ''
+    backup: true
+
 - name: Do not leak hostname to venue DHCP servers
   ansible.builtin.replace:
     path: /etc/dhcpcd.conf
@@ -704,12 +767,15 @@
 # would send the box's OWN lookups to Proton's resolver and straight past
 # blocky - no blocklist, no DoH. The tunnel does not need it: clients are told
 # their resolver by DHCP, and this box is told by resolv.conf below.
+# no_log because `replace` emits the whole before/after file under --diff, and
+# this one carries the private key.
 - name: Stop wg-quick hijacking the box's resolver
   ansible.builtin.replace:
     path: "/etc/wireguard/{{ vpn_interface }}.conf"
     regexp: '^DNS\s*=.*$'
     replace: '# DNS = removed by rasputin: this box resolves via blocky on 127.0.0.1'
   failed_when: false
+  no_log: true
 
 - name: Point the box at its own resolver
   ansible.builtin.copy:
