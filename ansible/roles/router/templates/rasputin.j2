@@ -33,7 +33,12 @@ BEGIN='# >>> rasputin managed >>>'
 END='# <<< rasputin managed <<<'
 
 die() { printf 'rasputin: %b\n' "$*" >&2; exit 1; }
-[[ $EUID -eq 0 ]] || die "must run as root"
+
+# Re-enter through sudo rather than refusing, so `rasputin join` works the way
+# it is written down. Always by absolute path, which is what the sudoers rule
+# pins - being reached through the /usr/local/bin symlink must not change which
+# path is checked. setuid is not the alternative: Linux ignores it on scripts.
+[[ $EUID -eq 0 ]] || exec sudo /usr/local/sbin/rasputin "$@"
 
 # --- the declared state ----------------------------------------------------
 write_dhcpcd_block() {
@@ -503,6 +508,10 @@ wpa_derive_psk() {
 join_network() {
   local ssid="${1:-}" pass="${2:-}" tmp top priority psk kind n
   [[ -n $ssid ]] || die "join needs an SSID:\n  rasputin join <ssid> [passphrase]\n  rasputin join --scan   (list what is on the air)"
+  # An unquoted multi-word SSID otherwise arrives as several operands and the
+  # second word is silently taken for the passphrase - joining the wrong
+  # network with the wrong key, and then blaming the key.
+  (( $# <= 2 )) || die "join takes one SSID and one optional passphrase.\n  quote a name with spaces in it: rasputin join \"Hotel Guest WiFi\""
   [[ -f $WPA_CONF ]] || die "$WPA_CONF is missing - nothing to join into"
   # wpa_supplicant has escaping rules for these inside a quoted ssid, and a
   # venue whose SSID needs them is rare enough that guessing wrong - and
@@ -511,6 +520,12 @@ join_network() {
   # A newline would close the ssid line and let the remainder of the argument
   # land in the config as directives of its own.
   [[ $ssid != *[[:cntrl:]]* ]] || die "SSIDs cannot contain control characters"
+  # 802.11 caps an SSID at 32 BYTES, and wpa_supplicant rejects the ENTIRE
+  # config over one oversized block, not merely that network. Unchecked, this
+  # writes a file the supplicant cannot parse, which costs the uplink at the
+  # next boot. Bytes, not characters: a 12-character CJK name is 36 of them.
+  n=$(printf '%s' "$ssid" | wc -c)
+  (( n <= 32 )) || die "SSIDs are limited to 32 bytes - that one is $n"
 
   kind=open
   if [[ -n $pass ]]; then
@@ -523,7 +538,10 @@ join_network() {
     [[ -n $psk ]] || die "could not derive a key for \"$ssid\""
   fi
 
-  tmp=$(mktemp)
+  # Alongside the target rather than in /tmp: the replacement below has to be a
+  # rename within one filesystem to be atomic. Copying leaves a window where
+  # the supplicant's only config is absent or half-written.
+  tmp=$(mktemp "${WPA_CONF}.rasputin.XXXXXX")
   wpa_strip_block "$ssid" "$WPA_CONF" > "$tmp"
 
   # Outrank everything already declared. At a venue the phone hotspot is in
@@ -532,7 +550,9 @@ join_network() {
   # using the venue's wifi is meant to save. Read after the strip, so
   # re-joining one SSID reclaims its old slot instead of ratcheting upwards.
   top=$(grep -hoE '^[[:space:]]*priority=[0-9]+' "$tmp" | grep -oE '[0-9]+' | sort -n | tail -1) || true
-  priority=$(( ${top:-0} + 1 ))
+  # 10# because a hand-written priority=09 is a typo, not octal, and letting
+  # bash reject it as a bad number aborts the run mid-write.
+  priority=$(( 10#${top:-0} + 1 ))
 
   {
     join_begin "$ssid"; echo
@@ -553,26 +573,41 @@ join_network() {
     join_end "$ssid"; echo
   } >> "$tmp"
 
-  install -m 0600 "$tmp" "$WPA_CONF"; rm -f "$tmp"
+  chmod 0600 "$tmp"; mv -f "$tmp" "$WPA_CONF"
   echo "rasputin: wrote network block for \"$ssid\" ($kind, priority $priority)"
   wpa_apply "$ssid"
 }
 
-# `wpa_cli reconfigure` re-reads the file in place. Restarting the supplicant
-# would also work and is worse twice over: it drops the association this
-# session may still be arriving over, and it hands a pinned MAC back to the
+# `wpa_cli reconfigure` re-reads the file in place. It is not seamless - the
+# supplicant deauthenticates and rescans on every reload, so the uplink blips
+# either way - but a full restart additionally hands a pinned MAC back to the
 # supplicant's own randomisation before the pin can be re-asserted.
 wpa_apply() {
-  local want="$1" i state ssid addr
-  wpa_cli -i "$WIFI" reconfigure >/dev/null 2>&1 \
-    || die "the block is written, but wpa_cli could not reach the supplicant on $WIFI.\n  it will be picked up by: systemctl restart wpa_supplicant@$WIFI"
+  local want="$1" i state ssid addr reply
+  # wpa_cli exits 0 even when the daemon answers FAIL, so its status says
+  # nothing: the answer has to be read. FAIL means the file did not parse, and
+  # one bad block rejects the WHOLE config - the running daemon keeps its old
+  # copy, so nothing looks wrong until the next boot comes up with no uplink.
+  reply=$(wpa_cli -i "$WIFI" reconfigure 2>/dev/null) || reply=""
+  case "$reply" in
+    OK*) ;;
+    FAIL*)
+      forget_network "$want" >/dev/null 2>&1 || true
+      die "the supplicant refused to parse its config with \"$want\" in it.\n  the block has been removed again, so the uplink still comes up at boot.\n  report this: the SSID passed every check and should have been representable." ;;
+    *) die "the block is written, but wpa_cli could not reach the supplicant on $WIFI.\n  it will be picked up by: systemctl restart wpa_supplicant@$WIFI" ;;
+  esac
 
   for i in $(seq 1 {{ wifi_reassociate_timeout | default(45) }}); do
-    # A wrong passphrase does not fail, it retries - the supplicant parks the
-    # network as TEMP-DISABLED and says nothing. Waiting out the full timeout
-    # to report "did not associate" would name the wrong problem.
-    if wpa_cli -i "$WIFI" list_networks 2>/dev/null | grep -F "$want" | grep -q 'TEMP-DISABLED'; then
-      die "\"$want\" rejected us - the supplicant has parked it as TEMP-DISABLED.\n  a wrong passphrase is the usual cause. re-run join with the right one."
+    # A rejected network does not fail, it retries - the supplicant parks it as
+    # TEMP-DISABLED and says nothing. Waiting out the full timeout to report
+    # "did not associate" would name the wrong problem.
+    #
+    # Matched on the ssid COLUMN: a substring test fires on "Hotel-Staff" while
+    # you are joining "Hotel", and blames the network you are actually using.
+    if wpa_cli -i "$WIFI" list_networks 2>/dev/null \
+         | awk -F'\t' -v s="$want" 'NR>1 && $2==s && $4 ~ /TEMP-DISABLED/ {hit=1} END{exit !hit}'; then
+      forget_network "$want" >/dev/null 2>&1 || true
+      die "\"$want\" refused us - the supplicant has parked it as TEMP-DISABLED.\n  a wrong passphrase is the usual cause; an AP that accepts the key and then\n  times out looks the same. the block has been removed again.\n  retry with: rasputin join \"$want\" <passphrase>"
     fi
     state=$(wpa_cli -i "$WIFI" status 2>/dev/null | sed -n 's/^wpa_state=//p')
     ssid=$(wpa_cli -i "$WIFI" status 2>/dev/null | sed -n 's/^ssid=//p')
@@ -602,6 +637,20 @@ wpa_apply() {
     fi
     sleep 1
   done
+  # Running out of loop is not proof of failure. wpa_cli renders every byte
+  # >= 0x7f as \xNN, so a non-ASCII SSID never compares equal to the argument
+  # as typed and the check above can never have matched. Associated with a
+  # routable address is the test that does not depend on how a name is spelled.
+  state=$(wpa_cli -i "$WIFI" status 2>/dev/null | sed -n 's/^wpa_state=//p') || true
+  ssid=$(wpa_cli -i "$WIFI" status 2>/dev/null | sed -n 's/^ssid=//p') || true
+  addr=$(ip -4 -o addr show dev "$WIFI" 2>/dev/null | awk '$4 !~ /^169\.254\./ {print $4; exit}') || true
+  if [[ $state == COMPLETED && -n $addr ]]; then
+    echo "rasputin: associated to \"$ssid\", $addr on $WIFI"
+    echo "rasputin: (the supplicant spells that name differently from \"$want\" as typed)"
+    portal_check || true
+    echo "rasputin: declare a profile to use it: {{ rasputin_profiles.keys()|join(', ') }}"
+    return 0
+  fi
   die "\"$want\" did not associate.\n  check the name against what is on the air: rasputin join --scan\n  the block stays written and outranks the others until: rasputin forget \"$want\""
 }
 
@@ -636,11 +685,15 @@ wpa_scan() {
 forget_network() {
   local ssid="${1:-}" tmp
   [[ -n $ssid ]] || die "forget needs an SSID: rasputin forget <ssid>"
-  grep -qF "$(join_begin "$ssid")" "$WPA_CONF" \
+  (( $# <= 1 )) || die "forget takes one SSID. Quote a name with spaces in it."
+  # -x, so the fence must be the whole line: a substring test passes for
+  # "Hotel" whenever "Hotel Annexe" is joined, then strips nothing and reports
+  # success for a network it never touched.
+  grep -qxF "$(join_begin "$ssid")" "$WPA_CONF" \
     || die "rasputin did not write a block for \"$ssid\" - it will not remove one it does not own"
-  tmp=$(mktemp)
+  tmp=$(mktemp "${WPA_CONF}.rasputin.XXXXXX")
   wpa_strip_block "$ssid" "$WPA_CONF" > "$tmp"
-  install -m 0600 "$tmp" "$WPA_CONF"; rm -f "$tmp"
+  chmod 0600 "$tmp"; mv -f "$tmp" "$WPA_CONF"
   wpa_cli -i "$WIFI" reconfigure >/dev/null 2>&1 || true
   echo "rasputin: forgot \"$ssid\""
 }
@@ -712,6 +765,11 @@ vpn_stop() {
 # 204-with-no-body is the agreed "you are online" answer, and a portal cannot
 # give it: to show you a login page it must answer 200 or redirect.
 #
+# The User-Agent is deliberately dull. A portal intercepts :80, so whatever we
+# send lands in the venue's logs - and a unique string there would identify
+# this box across every venue it ever probes, which is the identity the MAC
+# randomisation is spending effort to hide.
+#
 #   0  clear      1  portal (PORTAL_URL set)      2  no HTTP path at all
 portal_probe() {
   PORTAL_URL=""
@@ -720,7 +778,7 @@ portal_probe() {
     [[ -n "$ip" ]] || continue
     out=$(timeout 6 bash -c \
       'exec 3<>/dev/tcp/$1/80 || exit 1
-       printf "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: rasputin\r\n\r\n" "$3" "$2" >&3
+       printf "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: Mozilla/5.0\r\n\r\n" "$3" "$2" >&3
        head -c 4096 <&3' _ "$ip" "$host" "$path" 2>/dev/null) || continue
     code=$(printf '%s' "$out" | head -1 | awk '{print $2}')
     [[ $code == 204 ]] && return 0
@@ -1005,7 +1063,17 @@ converge() {
       # Arming the kill switch around a tunnel that can never handshake locks
       # this box out of the one network it needs in order to log in. That is
       # the chicken-and-egg that used to cost a second device and a cloned MAC.
-      1) die "a CAPTIVE PORTAL is in the way, so $VPN_IF will never handshake.\n  login page: $PORTAL_URL\n  clear it first:  rasputin portal\n  then:            rasputin $profile" ;;
+      #
+      # Leaving fail-closed on the way out, because this die sits BEFORE
+      # apply_firewall: at boot it otherwise left no table at all - no
+      # masquerade for the house, and the admin plane answering on the venue's
+      # own leg. A portal that expires overnight puts a morning reboot here.
+      # vpn=1 with wg0 absent matches no forward rule, so the house is offline
+      # rather than exposed, which is the right way round.
+      1) write_blocky_upstream 0
+         apply_firewall "$uplink" "$mode" 1 0 \
+           || echo "rasputin: WARNING - could not install the fail-closed ruleset" >&2
+         die "a CAPTIVE PORTAL is in the way, so $VPN_IF will never handshake.\n  login page: $PORTAL_URL\n  clear it first:  rasputin portal\n  then:            rasputin $profile" ;;
       2) echo "rasputin: WARNING - no HTTP path out $uplink at all - converging fail-closed" >&2 ;;
     esac
     vpn_start
