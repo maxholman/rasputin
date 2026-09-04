@@ -818,7 +818,23 @@
 # a second mac_addr= line instead of replacing it, and the file carries both.
 # rasputin re-asserts the pin on the converge at the end of a deploy, so a run
 # during a pinned session heals itself.
-- name: Randomise the wifi client MAC per network
+# rasputin owns these two keys at runtime: a profile with randomize_mac false
+# sets them to 0 at every converge. Ansible asserting 1 here as well meant the
+# two took turns - the deploy wrote 1, the converge at the end of the same deploy
+# wrote 0, and the supplicant restarted to arrive back where it started. So this
+# seeds a box that has never converged, and after that stays out of the way.
+#
+# The absent branch is unconditional because it is not a seed: with
+# randomize_client_mac false the whole MAC block is compiled out of rasputin,
+# nothing writes these keys, and the supplicant's own default is not to
+# randomise. Removing them is then the complete statement.
+- name: Check whether the supplicant already declares a randomisation setting
+  ansible.builtin.command: grep -c '^mac_addr=' /etc/wpa_supplicant/wpa_supplicant.conf
+  register: _wpa_mac_addr
+  changed_when: false
+  failed_when: false
+
+- name: Seed wifi client MAC randomisation
   ansible.builtin.lineinfile:
     path: /etc/wpa_supplicant/wpa_supplicant.conf
     regexp: "^{{ item.key }}="
@@ -828,6 +844,8 @@
   loop:
     - { key: mac_addr, value: 1 }
     - { key: preassoc_mac_addr, value: 1 }
+  when: _wpa_mac_addr.stdout | int == 0
+        or not (randomize_client_mac | default(true) | bool)
   notify: restart wpa_supplicant
 
 # Stop announcing ourselves to every venue's DHCP server. `hostname` sends

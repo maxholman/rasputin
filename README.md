@@ -417,6 +417,15 @@ Release it deliberately when you leave:
 `rasputin status` shows `PINNED`, or `PIN ... NOT APPLIED` if a pin exists but
 the interface is not wearing it.
 
+Randomising is per profile, because it is only worth its cost on a network that
+is not yours. `home` sets `randomize_mac: false`: that hotspot is our own phone,
+which recognises nobody and logs nothing, and a new MAC there only buys a new
+lease — often on a new subnet — on every converge and every boot. The venue
+profiles keep it on. Declining to randomise also turns off the supplicant's own
+`mac_addr=1`, which would otherwise hand the network a new client at the next
+association regardless; `rasputin status` reads `stable` rather than `random`
+in that state.
+
 Holding a MAC on `wlan0` took three corrections, all found on hardware and all
 invisible in a dry run:
 

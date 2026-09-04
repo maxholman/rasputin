@@ -161,10 +161,16 @@ randomize_client_mac: true
 # wrong. mode=serve means eth0 FEEDS a downstream network; mode=uplink means
 # eth0 CONSUMES the venue's.
 # ---------------------------------------------------------------------------
+#
+# randomize_mac is per profile because a fresh identity is only worth its cost
+# where the network is someone else's. Home is our own phone: it recognises
+# nobody, logs nothing, and hands a new MAC a new lease - often on a new subnet
+# - which renumbers the uplink on every converge and every boot for no gain.
+# Omitted, it follows randomize_client_mac.
 rasputin_profiles:
-  home: { mode: serve, vpn: false } # 5G hotspot upstream, no tunnel
-  hotel-wifi: { mode: serve, vpn: true } # venue wifi upstream, tunnel + killswitch
-  hotel-eth: { mode: uplink, vpn: true } # venue ethernet upstream, tunnel + killswitch
+  home: { mode: serve, vpn: false, randomize_mac: false } # 5G hotspot upstream, no tunnel
+  hotel-wifi: { mode: serve, vpn: true, randomize_mac: true } # venue wifi upstream, tunnel + killswitch
+  hotel-eth: { mode: uplink, vpn: true, randomize_mac: true } # venue ethernet upstream, tunnel + killswitch
 
 vpn_interface: wg0
 

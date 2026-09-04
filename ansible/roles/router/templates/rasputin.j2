@@ -374,16 +374,37 @@ WPA_CONF=/etc/wpa_supplicant/wpa_supplicant.conf
 # for as long as the pin lasts, and turning it back on when the pin is dropped.
 # With mac_addr=0 the supplicant leaves an externally-set address alone - it
 # does NOT restore the permanent one, which was the risk worth testing.
+# Both keys, because either one alone still moves the address:
+# preassoc_mac_addr randomises for the SCAN, and whatever it leaves on the
+# interface is what mac_addr=0 then politely declines to change. Turning off
+# only mac_addr buys an address that is stable until the next scan, which is
+# not stable.
+WPA_RANDOM_KEYS='mac_addr preassoc_mac_addr'
+
+# The same test set_wpa_randomisation uses to decide it has nothing to do,
+# separated out so a caller can ask the question without also answering it -
+# the difference between "already off" and "just turned off" is a supplicant
+# restart, and that is a dropped uplink.
+wpa_randomisation_is() {
+  local want="$1" k
+  [[ -f $WPA_CONF ]] || return 1
+  for k in $WPA_RANDOM_KEYS; do
+    [[ $(grep -c "^${k}=" "$WPA_CONF") -eq 1 ]] || return 1
+    grep -q "^${k}=${want}$" "$WPA_CONF" || return 1
+  done
+}
+
 set_wpa_randomisation() {
-  local want="$1"   # 1 = supplicant randomises per ESS; 0 = rasputin owns the MAC
+  local want="$1" k   # 1 = supplicant randomises per ESS; 0 = rasputin owns the MAC
   [[ -f $WPA_CONF ]] || return 0
-  # Delete-then-insert rather than substitute: Ansible writes this line too, and
-  # a config carrying both mac_addr=0 and mac_addr=1 is ambiguous about which
-  # wins. Collapsing to exactly one is the point, not just setting the value.
-  [[ $(grep -c '^mac_addr=' "$WPA_CONF") -eq 1 ]] \
-    && grep -q "^mac_addr=${want}$" "$WPA_CONF" && return 0
-  sed -i '/^mac_addr=/d' "$WPA_CONF"
-  sed -i "1i mac_addr=${want}" "$WPA_CONF"
+  wpa_randomisation_is "$want" && return 0
+  # Delete-then-insert rather than substitute: a config carrying both
+  # mac_addr=0 and mac_addr=1 is ambiguous about which wins. Collapsing to
+  # exactly one is the point, not just setting the value.
+  for k in $WPA_RANDOM_KEYS; do
+    sed -i "/^${k}=/d" "$WPA_CONF"
+    sed -i "1i ${k}=${want}" "$WPA_CONF"
+  done
 }
 
 # A captive portal authorises a MAC ADDRESS, not a person. Randomising on the
@@ -475,10 +496,10 @@ BLOCKY_UPSTREAM=/etc/blocky/config.d/15-upstream.yml
 resolve_profile() {
   case "$1" in
 {% for name, p in rasputin_profiles.items() %}
-    {{ name }}) MODE={{ p.mode }}; VPN={{ 1 if p.vpn else 0 }} ;;
+    {{ name }}) MODE={{ p.mode }}; VPN={{ 1 if p.vpn else 0 }}; MACRAND={{ 1 if p.randomize_mac | default(true) else 0 }} ;;
 {% endfor %}
-    serve|lan)   MODE=serve;  VPN=0 ;;
-    uplink|wan)  MODE=uplink; VPN=0 ;;
+    serve|lan)   MODE=serve;  VPN=0; MACRAND={{ 1 if randomize_client_mac | default(true) | bool else 0 }} ;;
+    uplink|wan)  MODE=uplink; VPN=0; MACRAND={{ 1 if randomize_client_mac | default(true) | bool else 0 }} ;;
     *) die "unknown profile: $1\n  known: {{ rasputin_profiles.keys()|join(' ') }} serve uplink" ;;
   esac
 }
@@ -709,7 +730,7 @@ EOF
 
 converge() {
   local profile; profile=$(cat "$STATE" 2>/dev/null) || die "no declared profile at $STATE - run: rasputin <profile>"
-  local MODE VPN; resolve_profile "$profile"
+  local MODE VPN MACRAND; resolve_profile "$profile"
   local mode="$MODE"
   local portal=0
   # A marker whose window has passed is stale - reap it here rather than let a
@@ -741,13 +762,30 @@ converge() {
   # holds its own copy of the config, reacts to the interface bounce, and
   # re-randomises over whatever was just set - measured on this hardware: the
   # pin was silently replaced. Stopped across the change, it holds.
-  if [[ "$uplink" == "$WIFI" ]]; then
-    supplicant stop
-    apply_uplink_mac "$uplink"
-    supplicant start
-    reassociate_wifi
-  else
-    apply_uplink_mac "$uplink"
+  if [[ $MACRAND == 1 ]]; then
+    if [[ "$uplink" == "$WIFI" ]]; then
+      supplicant stop
+      apply_uplink_mac "$uplink"
+      supplicant start
+      reassociate_wifi
+    else
+      apply_uplink_mac "$uplink"
+    fi
+  elif [[ "$uplink" == "$WIFI" ]]; then
+    # Keeping an identity means turning off the SUPPLICANT's own per-ESS
+    # randomisation, not merely skipping ours: mac_addr=1 hands the network a
+    # new client at the next association whatever rasputin did. The conf is read
+    # at startup only, so the setting costs a restart - taken solely when it
+    # actually moves, because an unconditional one would drop the uplink on
+    # every converge in order to change nothing.
+    if wpa_randomisation_is 0; then
+      echo "rasputin: $WIFI keeps the identity it has - this profile does not randomise"
+    else
+      supplicant stop
+      set_wpa_randomisation 0
+      supplicant start
+      reassociate_wifi
+    fi
   fi
 {% endif %}
 
@@ -907,6 +945,11 @@ mac_status_line() {
   cur=$(cat "/sys/class/net/$ifc/address" 2>/dev/null || echo '?')
   if [[ -f $MAC_PIN ]] && read -r p_if p_mac < "$MAC_PIN" && [[ $p_if == "$ifc" ]]; then
     [[ $p_mac == "$cur" ]] && echo "$cur PINNED" || echo "$cur PIN $p_mac NOT APPLIED"
+  # An unpinned MAC is no longer the same as a random one: a profile can decline
+  # to randomise, and the supplicant's own setting is what decides whether the
+  # next association takes a new address.
+  elif [[ $ifc == "$WIFI" ]] && wpa_randomisation_is 0; then
+    echo "$cur stable"
   else
     echo "$cur random"
   fi
