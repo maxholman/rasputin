@@ -463,6 +463,20 @@ apply_uplink_mac() {
 # also what a reboot costs anyway.
 ap_mac_new() {
 {% if randomize_ap_mac | default(true) | bool %}
+  local i
+  # The AP is a USB dongle and boot beats its enumeration: measured, wlan1 did
+  # not exist 7s in, and hostapd's own first start failed on "No such device"
+  # two seconds later and recovered only on its restart. Waiting here is what
+  # makes the randomisation land, and because hostapd is ordered after this it
+  # stops that first failure happening at all.
+  for i in $(seq 1 {{ ap_device_timeout | default(20) }}); do
+    [[ -e "/sys/class/net/$AP" ]] && break
+    sleep 1
+  done
+  if [[ ! -e "/sys/class/net/$AP" ]]; then
+    echo "rasputin: WARNING - $AP never appeared; leaving the AP to hostapd" >&2
+    return 0
+  fi
   # Never fatal. This runs Before=hostapd.service, and an AP that does not come
   # up is the one failure with no way back in - a predictable address is the
   # lesser problem by a wide margin.

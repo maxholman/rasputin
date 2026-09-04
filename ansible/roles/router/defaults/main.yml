@@ -99,6 +99,11 @@ randomize_client_mac: true
 # address to it, which is the correlation the client randomisation is buying.
 randomize_ap_mac: true
 
+# How long to wait at boot for the USB AP dongle to enumerate before giving up
+# on renaming it. Boot reaches hostapd before the device exists on this
+# hardware, which is why the wait is needed at all.
+ap_device_timeout: 20
+
 # ---------------------------------------------------------------------------
 # Venue profiles. One word sets WAN leg + VPN state + DNS upstream together,
 # because setting them independently at midnight in a hotel is how you get it
