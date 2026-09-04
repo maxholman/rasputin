@@ -534,6 +534,25 @@
 # randomize_client_mac false the whole MAC block is compiled out of rasputin,
 # nothing writes these keys, and the supplicant's own default is not to
 # randomise. Removing them is then the complete statement.
+# update_config=1 lets wpa_supplicant rewrite this file, and its canonical
+# output carries no comments - so it silently ate the fences `rasputin join`
+# writes around each network it owns, and `rasputin forget` could then no
+# longer prove ownership of a block it had written minutes earlier. Observed on
+# this box, not theorised: the supplicant rewrote the file and added its own
+# scan_ssid=1 after an association was rejected.
+#
+# Nothing here needs the supplicant to persist anything - rasputin writes this
+# file and `wpa_cli reconfigure` only reads it - so the write permission buys
+# nothing and costs the ownership marks. forget also matches on the ssid field
+# now, because a box deployed before this still has unfenced blocks on it.
+- name: Stop the supplicant rewriting its own config
+  ansible.builtin.lineinfile:
+    path: /etc/wpa_supplicant/wpa_supplicant.conf
+    regexp: '^update_config='
+    line: update_config=0
+    mode: "0600"
+  notify: restart wpa_supplicant
+
 - name: Check whether the supplicant already declares a randomisation setting
   ansible.builtin.command: grep -c '^mac_addr=' /etc/wpa_supplicant/wpa_supplicant.conf
   register: _wpa_mac_addr

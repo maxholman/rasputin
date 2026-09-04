@@ -543,6 +543,45 @@ join_end()   { printf '# <<< %s: %s <<<' "$JOIN_TAG" "$1"; }
 # Exact string comparison against the fence lines rather than a sed range: an
 # SSID is arbitrary text off a hotel card, and as a sed address one carrying
 # regex metacharacters would delete the wrong lines or fail to compile at all.
+# The fences are not guaranteed to survive. wpa_supplicant rewrites this file
+# itself whenever update_config is on - the image ships it on - and its
+# canonical form carries no comments at all, so a block join wrote can end up
+# present but unfenced. Refusing to touch it then would leave the way out
+# broken at exactly the venue that needed it, so ownership falls back to the
+# ssid field, which is the thing the operator actually named.
+#
+# Buffered rather than streamed because the ssid line comes after the opening
+# brace: the decision to keep a block cannot be made until its closing one.
+wpa_strip_ssid_block() {
+  awk -v want="$1" '
+    /^[[:space:]]*network[[:space:]]*=[[:space:]]*{/ { inb = 1; buf = $0 ORS; hit = 0; next }
+    inb {
+      buf = buf $0 ORS
+      if ($0 ~ /^[[:space:]]*ssid="/) {
+        v = $0
+        sub(/^[[:space:]]*ssid="/, "", v)
+        sub(/"[[:space:]]*$/, "", v)
+        if (v == want) hit = 1
+      }
+      if ($0 ~ /^[[:space:]]*}[[:space:]]*$/) { if (!hit) printf "%s", buf; inb = 0 }
+      next
+    }
+    { print }
+  ' "$2"
+}
+
+wpa_has_ssid_block() {
+  awk -v want="$1" '
+    /^[[:space:]]*ssid="/ {
+      v = $0
+      sub(/^[[:space:]]*ssid="/, "", v)
+      sub(/"[[:space:]]*$/, "", v)
+      if (v == want) { found = 1 }
+    }
+    END { exit !found }
+  ' "$2"
+}
+
 wpa_strip_block() {
   awk -v b="$(join_begin "$1")" -v e="$(join_end "$1")" '
     $0 == b { inside = 1 }
@@ -599,6 +638,12 @@ join_network() {
   # the supplicant's only config is absent or half-written.
   tmp=$(mktemp "${WPA_CONF}.rasputin.XXXXXX")
   wpa_strip_block "$ssid" "$WPA_CONF" > "$tmp"
+  # Anything left declaring the same SSID would be a second, competing block:
+  # the supplicant honours both, and which one wins is not ours to predict.
+  if wpa_has_ssid_block "$ssid" "$tmp"; then
+    echo "rasputin: replacing an existing declaration of \"$ssid\""
+    wpa_strip_ssid_block "$ssid" "$tmp" > "$tmp.2" && mv -f "$tmp.2" "$tmp"
+  fi
 
   # Outrank everything already declared. At a venue the phone hotspot is in
   # your pocket and therefore in range, and with nothing to separate them the
@@ -748,13 +793,19 @@ forget_network() {
   local ssid="${1:-}" tmp
   [[ -n $ssid ]] || die "forget needs an SSID: rasputin forget <ssid>"
   (( $# <= 1 )) || die "forget takes one SSID. Quote a name with spaces in it."
+  tmp=$(mktemp "${WPA_CONF}.rasputin.XXXXXX")
   # -x, so the fence must be the whole line: a substring test passes for
   # "Hotel" whenever "Hotel Annexe" is joined, then strips nothing and reports
   # success for a network it never touched.
-  grep -qxF "$(join_begin "$ssid")" "$WPA_CONF" \
-    || die "rasputin did not write a block for \"$ssid\" - it will not remove one it does not own"
-  tmp=$(mktemp "${WPA_CONF}.rasputin.XXXXXX")
-  wpa_strip_block "$ssid" "$WPA_CONF" > "$tmp"
+  if grep -qxF "$(join_begin "$ssid")" "$WPA_CONF"; then
+    wpa_strip_block "$ssid" "$WPA_CONF" > "$tmp"
+  elif wpa_has_ssid_block "$ssid" "$WPA_CONF"; then
+    echo "rasputin: \"$ssid\" has no rasputin fence - the supplicant rewrote this file"
+    wpa_strip_ssid_block "$ssid" "$WPA_CONF" > "$tmp"
+  else
+    rm -f "$tmp"
+    die "no network declaring \"$ssid\" is in $WPA_CONF"
+  fi
   chmod 0600 "$tmp"; mv -f "$tmp" "$WPA_CONF"
   wpa_cli -i "$WIFI" reconfigure >/dev/null 2>&1 || true
   echo "rasputin: forgot \"$ssid\""
