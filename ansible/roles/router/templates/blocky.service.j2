@@ -7,6 +7,13 @@ Documentation=https://0xerr0r.github.io/blocky/
 After=network.target dhcpcd.service
 Wants=network.target
 
+# systemd only reads this in [Unit]. It sat in [Service], where it was silently
+# ignored - "Unknown key 'StartLimitIntervalSec' in section [Service]" in the
+# log at every boot - so the default 5-starts-in-10s limit was live and the
+# comment below promised a protection that was not there. Boot needs 5 to 6
+# restarts to outlast dhcpcd assigning the listen addresses.
+StartLimitIntervalSec=0
+
 [Service]
 Type=simple
 User={{ blocky_user }}
@@ -20,11 +27,10 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
 # Never give up. On this box a dead resolver means no DNS for every client,
 # and the usual cause is transient - a LAN address that dhcpcd has not
-# assigned yet. StartLimitIntervalSec=0 disables the burst limit that would
-# otherwise leave it failed after a few quick retries at boot.
+# assigned yet. The burst limit that would otherwise leave it failed after a
+# few quick retries is disabled in [Unit], where systemd reads it.
 Restart=always
 RestartSec=3
-StartLimitIntervalSec=0
 
 NoNewPrivileges=true
 ProtectSystem=strict

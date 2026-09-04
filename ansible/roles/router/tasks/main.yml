@@ -283,6 +283,55 @@
   failed_when: false
   when: disable_nm_wait_online | bool
 
+# --- who owns which interface ------------------------------------------------
+# NetworkManager ships with the image and cannot be purged (iptables depends on
+# it), so the only question is what it is allowed to touch. The answer is
+# nothing: dhcpcd owns every address on this box, wpa_supplicant owns the uplink
+# association.
+#
+# {{ eth_if }} was missing from the undeclared list this replaces, and in serve
+# mode that interface carries the LAN's gateway address. NM claimed it, ran DHCP
+# against a network whose only DHCP server is us, failed on the 45s timeout, and
+# tore the address off the interface on its way out - once per failed
+# activation, for as long as it kept retrying. Measured, not inferred: dhcpcd
+# logs the pid that deleted the address, and it is NetworkManager's.
+- name: NetworkManager owns none of this router's interfaces
+  ansible.builtin.copy:
+    dest: /etc/NetworkManager/conf.d/99-rasputin-unmanaged.conf
+    mode: "0644"
+    content: |
+      # Managed by Ansible. Edit the role, not this file.
+      [main]
+      dns=none
+
+      [keyfile]
+      unmanaged-devices=interface-name:{{ eth_if }};interface-name:{{ wan_wifi_if }};interface-name:{{ ap_if }}
+  notify: reload NetworkManager
+
+# --- the log that outlives the reboot ----------------------------------------
+# Raspberry Pi OS ships 40-rpi-volatile-storage.conf with Storage=volatile, so
+# the journal lives in /run and a reboot takes it. On a box whose failure report
+# is "it stopped working so I power cycled it", that guarantees the one boot
+# worth reading is the one that no longer exists. Capped, because the SD card is
+# what wears out.
+- name: Directory for the journald drop-in
+  ansible.builtin.file:
+    path: /etc/systemd/journald.conf.d
+    state: directory
+    mode: "0755"
+
+- name: Keep the journal across reboots
+  ansible.builtin.copy:
+    dest: /etc/systemd/journald.conf.d/50-rasputin-persistent.conf
+    mode: "0644"
+    content: |
+      # Managed by Ansible. Edit the role, not this file.
+      [Journal]
+      Storage=persistent
+      SystemMaxUse=200M
+      SystemMaxFileSize=20M
+  notify: restart journald
+
 # dpkg writes a .dpkg-dist beside any conffile it did not overwrite, which with
 # --force-confold on an upgrade means every packaged config this box declares
 # for itself. They are inert, and each one is a second copy of a config file

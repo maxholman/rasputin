@@ -78,3 +78,19 @@
 - name: reload ssh
   ansible.builtin.shell: sshd -t && systemctl reload ssh
   changed_when: true
+
+# Reload, not restart: a restart re-runs device activation, which is the exact
+# behaviour the unmanaged drop-in exists to stop.
+- name: reload NetworkManager
+  ansible.builtin.systemd:
+    name: NetworkManager
+    state: reloaded
+
+# The restart alone leaves journald reading the new config and still writing to
+# /run: it opens the persistent journal at the flush, and the flush is a boot
+# step that has already happened. `journalctl --flush` is what asks for it
+# again, and it migrates the runtime entries across rather than stranding them,
+# so enabling persistence does not cost the boot it was enabled on.
+- name: restart journald
+  ansible.builtin.shell: systemctl restart systemd-journald && journalctl --flush
+  changed_when: true
