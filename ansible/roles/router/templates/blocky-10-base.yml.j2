@@ -11,11 +11,16 @@
 # and one file written from one place beats reasoning about how two config.d
 # fragments merge. Every query leaves over TLS in every profile except that one.
 
-# Resolving the upstream's OWN hostname cannot go through the upstream.
-# {{ blocky_bootstrap }} is reachable by IP because its certificate carries IP
-# SANs - Quad9's does not, which is why it cannot be used here.
+# Resolving the upstream's OWN hostname cannot go through the upstream. Several,
+# because one venue hijacked the single address this used to name - see
+# blocky_bootstrap in the role for the measurement.
 bootstrapDns:
-  - upstream: {{ blocky_bootstrap }}
+{% for b in blocky_bootstrap %}
+  - upstream: {{ b.upstream }}
+{% if b.ips is defined %}
+    ips: [{{ b.ips | join(', ') }}]
+{% endif %}
+{% endfor %}
 
 # We neither advertise nor route IPv6 to clients, so an AAAA upstream path
 # would only produce answers with no return route.

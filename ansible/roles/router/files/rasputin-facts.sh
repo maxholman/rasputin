@@ -14,7 +14,13 @@ else echo "gw $gw unreachable"
 fi
 t0=$(date +%s%3N)
 if timeout 2 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' 2>/dev/null; then echo "tcp443 open $(( $(date +%s%3N) - t0 ))"; else echo "tcp443 no-path"; fi
-if command -v curl >/dev/null; then echo "extip $(curl -s --max-time 2 https://1.1.1.1/cdn-cgi/trace | awk -F= '/^ip=/{print $2}')"
+# Two addresses, because a venue firewall can hijack one and not the other -
+# measured 2026-09-05: 1.1.1.1 answered with the hotel's own certificate while
+# 1.0.0.1 passed clean, and the status tool showed a portal for the whole stay.
+if command -v curl >/dev/null; then
+  extip=$(curl -s --max-time 2 https://1.1.1.1/cdn-cgi/trace | awk -F= '/^ip=/{print $2}')
+  [ -n "$extip" ] || extip=$(curl -s --max-time 2 https://1.0.0.1/cdn-cgi/trace | awk -F= '/^ip=/{print $2}')
+  echo "extip $extip"
 else echo "extip nocurl"; fi
 s wg;       wg show wg0 2>/dev/null
 s addrs;    ip -br addr show 2>/dev/null

@@ -441,7 +441,7 @@
 
 - name: Read the declared profile
   ansible.builtin.set_fact:
-    _declared: "{{ (_mode_file.content | b64decode | trim) if (_mode_file.content is defined) else default_mode }}"
+    _declared: "{{ (_mode_file.content | b64decode | trim) if (_mode_file.content is defined) else default_profile }}"
 
 # /etc/rasputin/mode holds a PROFILE name now, not a raw mode. Comparing it
 # directly against 'serve' meant the profile 'home' - which IS serve - looked
@@ -450,7 +450,10 @@
 # rasputin uses, so the two can never disagree.
 - name: Resolve the profile to a mode
   ansible.builtin.set_fact:
-    effective_mode: "{{ rasputin_profiles[_declared].mode if (_declared in rasputin_profiles) else _declared }}"
+    effective_mode: >-
+      {{ ('uplink' if rasputin_profiles[_declared].uplink == eth_if else 'serve')
+         if (_declared in rasputin_profiles)
+         else ('uplink' if _declared in ['uplink', 'wan'] else 'serve') }}
 
 - name: Show which mode config is being applied for
   ansible.builtin.debug:
@@ -699,10 +702,14 @@
   when: _avahi.changed | default(false)
   failed_when: false
 
+# validate, because the converge handler runs this file minutes later and a
+# script that does not parse would leave the box with no way to rebuild its
+# firewall at the next boot.
 - name: Install rasputin
   ansible.builtin.template:
     src: rasputin.j2
     dest: /usr/local/sbin/rasputin
+    validate: bash -n %s
     mode: "0755"
   notify: converge rasputin
 
@@ -729,7 +736,7 @@
 - name: Seed the declared mode if unset
   ansible.builtin.copy:
     dest: /etc/rasputin/mode
-    content: "{{ default_mode }}\n"
+    content: "{{ default_profile }}\n"
     mode: "0644"
     force: false
 

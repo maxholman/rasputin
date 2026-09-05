@@ -1,7 +1,13 @@
-# {{ ap_if }} is the USB dongle and is ALWAYS the AP. Constant in both modes.
+# {{ ap_if }} is the USB dongle and is ALWAYS the AP. Constant in every profile.
 interface={{ ap_if }}
-dhcp-range={{ ap_subnet }}.{{ ap_dhcp_start }},{{ ap_subnet }}.{{ ap_dhcp_end }},255.255.255.0,12h
+dhcp-range=set:ap,{{ ap_subnet }}.{{ ap_dhcp_start }},{{ ap_subnet }}.{{ ap_dhcp_end }},255.255.255.0,12h
 # Point clients at THIS box, and only this box. Handing out a public
 # resolver as well would let every client silently bypass the blocklist,
 # the DoH upstream and the kill switch the moment blocky hiccupped.
-dhcp-option=6,{{ ap_subnet }}.1
+#
+# tag:ap, because an untagged option is GLOBAL. With both legs declaring
+# option 6 untagged, the eth0 file (read second) won for every client, and the
+# AP's clients were handed 10.6.141.1 - an address this box does not even hold
+# while eth0 is unplugged. Measured 2026-09-05: a laptop on the AP at a hotel
+# with a gateway that worked and a resolver that did not exist.
+dhcp-option=tag:ap,6,{{ ap_subnet }}.1

@@ -425,7 +425,9 @@ fn dns_query_a(server: &str, domain: &str) -> Result<(Vec<String>, u128, u8), St
 /// Some(false) = open egress, None = unknown profile, state facts only.
 fn vpn_expected(profile: &str) -> Option<bool> {
     match profile {
-        "home" | "serve" | "lan" | "uplink" | "wan" => Some(false),
+        // The bare mode words are what an old state file may still say until
+        // its next converge rewrites it; they never promised a tunnel.
+        "home" | "hotel-wifi-novpn" | "hotel-eth-novpn" | "serve" | "lan" | "uplink" | "wan" => Some(false),
         "hotel-wifi" | "hotel-eth" => Some(true),
         _ => None,
     }
@@ -436,8 +438,8 @@ fn vpn_expected(profile: &str) -> Option<bool> {
 /// tunnel is up).
 fn uplink_if(profile: &str) -> Option<&'static str> {
     match profile {
-        "home" | "serve" | "lan" | "hotel-wifi" => Some("wlan0"),
-        "hotel-eth" | "uplink" | "wan" => Some("eth0"),
+        "home" | "hotel-wifi" | "hotel-wifi-novpn" | "serve" | "lan" => Some("wlan0"),
+        "hotel-eth" | "hotel-eth-novpn" | "uplink" | "wan" => Some("eth0"),
         _ => None,
     }
 }
@@ -551,6 +553,10 @@ fn ports(st: &Status) -> Vec<Port> {
             (false, _, _, _) => PortState::Unknown,
             (_, "?", _, _) => PortState::Unknown,
             (_, "—", _, _) => PortState::Unused,
+            // A LAN leg with nothing plugged into it has nobody to serve. That
+            // is not a fault, and painting it red for a whole hotel stay taught
+            // the eye to ignore the colour.
+            (_, "lan", false, _) => PortState::Unused,
             (_, _, false, _) => PortState::Down,
             (_, _, true, "—") => PortState::NoAddr,
             _ => PortState::Up,
@@ -565,7 +571,7 @@ fn ports(st: &Status) -> Vec<Port> {
                 st.ap_channel.split_whitespace().next().unwrap_or("?"),
                 st.station_signals.len()
             ),
-            _ if !st.eth_carrier => "no carrier".into(),
+            _ if !st.eth_carrier => if role == "lan" { "unplugged".into() } else { "no carrier".into() },
             _ if st.eth_speed == "-" || st.eth_speed.is_empty() => "link up".into(),
             _ => format!("{} Mb/s", st.eth_speed),
         };
@@ -867,6 +873,9 @@ fn build_lines(
                     (format!("{ip}{lat} ✓"), false)
                 }
                 "unprobed" => (format!("{ip} · not probed (kill switch)"), false),
+                // A gateway that drops ICMP is common at venues. It is only a
+                // fault when nothing else gets out either.
+                _ if st.wan_tcp.starts_with("open") => (format!("{ip} · no ping reply"), false),
                 _ => (format!("{ip} UNREACHABLE"), true),
             }
         }
@@ -1291,8 +1300,16 @@ mod tests {
 
     #[test]
     fn state_separates_no_carrier_from_no_lease() {
+        // eth0 unplugged while it is a LAN leg has nobody to serve: grey.
         let mut s = st("home");
         s.ifaces.insert("eth0".into(), "DOWN".into());
+        s.eth_carrier = false;
+        assert!(ports(&s)[2].state == PortState::Unused);
+        assert_eq!(ports(&s)[2].detail, "unplugged");
+        // The same cable missing where eth0 IS the uplink is a fault.
+        let mut s = st("hotel-eth");
+        s.ifaces.insert("eth0".into(), "DOWN".into());
+        s.eth_carrier = false;
         assert!(ports(&s)[2].state == PortState::Down);
 
         let mut s = st("home");

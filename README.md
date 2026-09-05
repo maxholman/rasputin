@@ -18,30 +18,43 @@ These are physical facts, not settings:
 - `wlan1` (USB MT7921)        — **always** the AP
 - `eth0`                      — the only interface that changes role
 
-So there are exactly two modes.
+So a **profile** has two axes and nothing else: which leg faces the venue, and
+whether anything may leave except through the tunnel. `eth0`'s role follows
+from the first — a DHCP client when it *is* the uplink, a LAN leg (10.6.141.1,
+DHCP server) otherwise — and an unplugged LAN leg has nobody to serve, so it
+stays out of the way.
 
-Modes are named for **which way `eth0` faces**, never for whose WAN it is —
-"eth0 is the WAN for UniFi" means eth0 *serves*, so perspective-based names
-invite exactly the wrong command.
-
-| | `eth0` | uplink | serving |
+| profile | uplink | tunnel + kill switch | `eth0` |
 |---|---|---|---|
-| `rasputin serve` | **provides** a WAN interface to another client (UniFi) | `wlan0` → hotspot | `eth0` (10.6.141.1) + `wlan1` AP (10.9.141.1) |
-| `rasputin uplink` | **connects to** a WAN (venue ethernet, DHCP) | `eth0` | `wlan1` AP only |
+| `home` | `wlan0` → own hotspot | no | serves the wired net |
+| `hotel-wifi` | `wlan0` → venue wifi | **yes** | serves the wired net |
+| `hotel-wifi-novpn` | `wlan0` → venue wifi | no | serves the wired net |
+| `hotel-eth` | `eth0` → venue ethernet | **yes** | is the uplink |
+| `hotel-eth-novpn` | `eth0` → venue ethernet | no | is the uplink |
 
-`lan` and `wan` still work as aliases for `serve` and `uplink`.
+There is no mode word to type. `serve` and `uplink` used to say which way
+`eth0` faced and nothing about the tunnel, which is how the box spent a night
+on venue wifi with no VPN under a name that said nothing of the kind. Typed,
+they are refused and the equivalent profile is named; read from an old state
+file, they are understood and rewritten.
 
 ## Usage
 
-    rasputin serve      # eth0 provides a WAN to UniFi (default)
-    rasputin uplink     # eth0 consumes a WAN from the venue
+    rasputin <profile>  # declare it, then converge (see the table above)
     rasputin status     # declared vs actual
-    rasputin converge   # re-apply declared mode (runs at boot)
+    rasputin converge   # re-apply the declared profile (runs at boot)
+    rasputin join       # put a venue's wifi in the supplicant config and join it
     rasputin portal     # open a bounded hole to clear a captive portal
     rasputin mac-new    # drop the pinned uplink MAC, take a fresh identity
 
-`serve`/`uplink` write `/etc/rasputin/mode`, then converge. Boot runs the same
+Naming a profile writes `/etc/rasputin/mode`, then converges. Boot runs the same
 converge path, so there is no drift between "what I asked for" and "what boots".
+
+At a venue with a captive portal the order is: `join`, then `portal`, log in,
+then the profile you want. Declaring a tunnel profile *before* the portal is
+cleared is safe — converge probes for the portal with its own output guard
+open and refuses to arm the kill switch behind one — but it cannot get you
+online; only `portal` can.
 
 ## Deploy
 
@@ -61,7 +74,7 @@ firewall up behind a rollback window:
     ansible-playbook site.yml --ask-become-pass -e converge_on_deploy=false
 
     # 2. apply mode + firewall, auto-reverting in 5 minutes
-    ssh -t max@10.6.141.1 'sudo rasputin serve --rollback 300'
+    ssh -t max@10.6.141.1 'sudo rasputin home --rollback 300'
 
     # 3. from a NEW terminal - prove you can still get in, then keep it
     ssh -t max@10.6.141.1 'sudo rasputin confirm'
@@ -126,10 +139,10 @@ hostile by definition.
 SSH is permitted only on interfaces acting as **LAN in the current mode** —
 role-based, not name-based, so it follows `eth0` when it changes job:
 
-| mode | admin allowed | denied |
+| uplink | admin allowed | denied |
 |---|---|---|
-| `serve` | `wlan1` AP, `eth0` | `wlan0` (uplink) |
-| `uplink` | `wlan1` AP | `eth0` (now uplink), `wlan0` |
+| `wlan0` (`home`, `hotel-wifi*`) | `wlan1` AP, `eth0` | `wlan0` |
+| `eth0` (`hotel-eth*`) | `wlan1` AP | `eth0` (now uplink), `wlan0` |
 
 `admin_on_uplink: true` overrides this and exposes SSH to the venue. It defaults
 to false and should stay there.
@@ -164,14 +177,14 @@ interface it may use, and no inbound firewall rule can stop it, because these
 are packets we *send*; the output chain only clamps down when a tunnel is up.
 
 `deny-interfaces` is set to whichever leg faces the venue: `wlan0` always (a
-hardware invariant), plus `eth0` in `uplink` mode. `.local` keeps working on
+hardware invariant), plus `eth0` when a profile makes it the uplink. `.local` keeps working on
 the AP; the venue hears nothing. rasputin rewrites it per mode.
 
 ### Don't lock yourself out
 
 Tightening this remotely can strand you at a conference. Use the rollback window:
 
-    rasputin serve --rollback 300    # firewall reverts in 5 min unless confirmed
+    rasputin home --rollback 300     # firewall reverts in 5 min unless confirmed
     rasputin confirm               # cancel the revert, keep the ruleset
 
 Existing SSH sessions survive a bad ruleset (the `ct state established` rule is

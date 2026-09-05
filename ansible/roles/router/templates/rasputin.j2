@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# rasputin - declare which role {{ eth_if }} plays, then converge onto it.
+# rasputin - declare a venue profile, then converge onto it.
 #
-#   rasputin serve     {{ eth_if }} FEEDS the wired network - this is UniFi WAN
-#   rasputin uplink    {{ eth_if }} TAKES an address from the venue ethernet
+#   rasputin <profile> which leg faces the venue, and whether a tunnel is
+#                      required. {{ eth_if }} serves the wired network unless
+#                      it IS the uplink; unplugged, it has nobody to serve.
 #   rasputin status    show declared vs actual
 #   rasputin converge  re-apply the declared mode (runs at boot)
 #   rasputin refresh   re-apply the firewall for the uplink's current address
@@ -124,10 +125,11 @@ apply_firewall() {
   upgw=$(ip -4 route show default dev "$uplink" 2>/dev/null \
          | awk '{for(i=1;i<=NF;i++) if($i=="via") {print $(i+1); exit}}')
   if [[ -n "$upnet" ]]; then
-    # With the tunnel up there is no legitimate reason for a client to talk to
-    # the venue gateway in the clear - the portal was completed before the VPN
-    # came up. Leaving the exception open would be a hole straight through the
-    # kill switch to a venue-controlled device.
+    # With the profile demanding the tunnel there is no legitimate reason for a
+    # client to talk to the venue gateway in the clear: converge refuses to arm
+    # the switch behind a portal, and a portal that appears later is what
+    # `rasputin portal` is for. Leaving the exception open would be a hole
+    # straight through the kill switch to a venue-controlled device.
     if [[ -n "$upgw" && $vpn != 1 ]]; then
       # Only the ports a captive portal needs. A blanket accept here would let
       # SMB and mDNS reach the venue's own gateway - the exact inventory leak
@@ -137,7 +139,7 @@ apply_firewall() {
     iifname @lan_ifaces oifname \"$uplink\" ip daddr $upgw tcp dport 53 accept
 "
     elif [[ $vpn == 1 ]]; then
-      echo "rasputin: captive-portal exception withheld - the tunnel is up, so the portal is already done" >&2
+      echo "rasputin: captive-portal exception withheld - this profile sends clients through $VPN_IF; a login page is reached with: rasputin portal" >&2
     else
       echo "rasputin: WARNING - no gateway on $uplink; captive portals will be unreachable" >&2
     fi
@@ -514,13 +516,23 @@ supplicant() {
 # settled once associated: preassoc_mac_addr=1 randomises during the scan, so
 # sampling earlier reports an address the interface is about to stop wearing.
 reassociate_wifi() {
-  local i
+  local i nudged=0
   for i in $(seq 1 {{ wifi_reassociate_timeout | default(45) }}); do
-    if [[ -n "$(ip -4 -o addr show dev "$WIFI" 2>/dev/null)" ]]; then
+    # 169.254 is dhcpcd giving up, not an address - see wait_for_v4.
+    if [[ -n "$(ip -4 -o addr show dev "$WIFI" 2>/dev/null | awk '$4 !~ /^169\.254\./')" ]]; then
       echo "rasputin: $WIFI reassociated as $(cat /sys/class/net/$WIFI/address)"
       return 0
     fi
-    dhcpcd -n "$WIFI" >/dev/null 2>&1 || true
+    # One nudge, once associated, for the case where dhcpcd is still holding
+    # the previous network's lease. Not one per second: `dhcpcd -n` is a REBIND,
+    # and a venue with a second DHCP server answers a rebind for a lease it did
+    # not grant with a NAK - measured 2026-09-05, 10.0.64.2 taking away what
+    # 10.0.64.1 had just leased, once a second, for a minute, with the firewall
+    # rebuilding itself behind every change.
+    if (( ! nudged )) && [[ $(wpa_cli -i "$WIFI" status 2>/dev/null | sed -n 's/^wpa_state=//p') == COMPLETED ]]; then
+      dhcpcd -n "$WIFI" >/dev/null 2>&1 || true
+      nudged=1
+    fi
     sleep 1
   done
   echo "rasputin: WARNING - $WIFI has no address after MAC change" >&2
@@ -682,7 +694,22 @@ join_network() {
     echo "rasputin: dropped the pinned MAC - a new network gets a new identity"
   fi
   echo "rasputin: wrote network block for \"$ssid\" ($kind, priority $priority)"
-  wpa_apply "$ssid"
+  local restart=0
+{% if randomize_client_mac | default(true) | bool %}
+  # Joining somewhere is the venue's first sight of this box, and the declared
+  # profile may still be one that keeps the permanent address - `home`, on a
+  # box powered on at the hotel. By the time a venue profile is declared the
+  # real MAC has been on the air for as long as it took to type it, so join
+  # turns the supplicant's randomisation on whatever the profile says. That
+  # setting is read at startup only, which is why this path restarts the
+  # supplicant where a plain join merely reconfigures it.
+  local MODE VPN MACRAND PROFILE_NAME
+  if profile_lookup "$(cat "$STATE" 2>/dev/null)" && [[ $MACRAND == 0 ]] && ! wpa_randomisation_is 1; then
+    set_wpa_randomisation 1; restart=1
+    echo "rasputin: '$PROFILE_NAME' keeps the permanent MAC, but this is a new network - $WIFI takes a random one"
+  fi
+{% endif %}
+  wpa_apply "$ssid" "$restart"
 }
 
 # `wpa_cli reconfigure` re-reads the file in place. It is not seamless - the
@@ -690,7 +717,7 @@ join_network() {
 # either way - but a full restart additionally hands a pinned MAC back to the
 # supplicant's own randomisation before the pin can be re-asserted.
 wpa_apply() {
-  local want="$1" i state ssid addr reply
+  local want="$1" restart="${2:-0}" i state ssid addr reply
   # wpa_cli exits 0 even when the daemon answers FAIL, so its status says
   # nothing: the answer has to be read. FAIL means the file did not parse, and
   # one bad block rejects the WHOLE config - the running daemon keeps its old
@@ -703,6 +730,8 @@ wpa_apply() {
       die "the supplicant refused to parse its config with \"$want\" in it.\n  the block has been removed again, so the uplink still comes up at boot.\n  report this: the SSID passed every check and should have been representable." ;;
     *) die "the block is written, but wpa_cli could not reach the supplicant on $WIFI.\n  it will be picked up by: systemctl restart wpa_supplicant@$WIFI" ;;
   esac
+  # After the reconfigure, so the file has already passed the daemon's parser.
+  [[ $restart == 1 ]] && supplicant restart
 
   for i in $(seq 1 {{ wifi_reassociate_timeout | default(45) }}); do
     # A rejected network does not fail, it retries - the supplicant parks it as
@@ -839,17 +868,33 @@ VPN_IF={{ vpn_interface }}
 BLOCKY_LISTEN=/etc/blocky/config.d/20-listen.yml
 BLOCKY_UPSTREAM=/etc/blocky/config.d/15-upstream.yml
 
-# A profile is the unit of switching. MODE decides eth0's role, VPN decides
-# whether traffic may leave any way other than the tunnel.
-resolve_profile() {
+# A profile is the unit of switching, and it has two axes: which leg faces the
+# venue, and whether traffic may leave any way other than the tunnel.
+# {{ eth_if }}'s role FOLLOWS from the first - a client when it is the uplink, a
+# LAN leg otherwise - so MODE is derived here and never typed.
+#
+# The mode words from before profiles are still understood when READ, because
+# a state file written back then may carry one and boot must not die on it.
+# They are refused when TYPED: "serve" said which way {{ eth_if }} faced and
+# nothing about the tunnel, and a box on venue wifi with no VPN deserves a name
+# that says so.
+profile_lookup() {
+  PROFILE_NAME="$1"
   case "$1" in
 {% for name, p in rasputin_profiles.items() %}
-    {{ name }}) MODE={{ p.mode }}; VPN={{ 1 if p.vpn else 0 }}; MACRAND={{ 1 if p.randomize_mac | default(true) else 0 }} ;;
+    {{ name }}) MODE={{ 'uplink' if p.uplink == eth_if else 'serve' }}; VPN={{ 1 if p.vpn else 0 }}; MACRAND={{ 1 if p.randomize_mac | default(true) else 0 }} ;;
 {% endfor %}
-    serve|lan)   MODE=serve;  VPN=0; MACRAND={{ 1 if randomize_client_mac | default(true) | bool else 0 }} ;;
-    uplink|wan)  MODE=uplink; VPN=0; MACRAND={{ 1 if randomize_client_mac | default(true) | bool else 0 }} ;;
-    *) die "unknown profile: $1\n  known: {{ rasputin_profiles.keys()|join(' ') }} serve uplink" ;;
+{% for alias, target in legacy_profile_aliases.items() %}
+    {{ alias }}) profile_lookup {{ target }} ;;
+{% endfor %}
+    *) return 1 ;;
   esac
+}
+
+resolve_profile() {
+  profile_lookup "$1" || die "unknown profile: $1\n  known: {{ rasputin_profiles.keys()|join(' ') }}"
+  [[ $PROFILE_NAME == "$1" ]] \
+    || echo "rasputin: '$1' is a mode word from before profiles - reading it as '$PROFILE_NAME'" >&2
 }
 
 vpn_start() {
@@ -908,9 +953,31 @@ TARGETS
   return 2
 }
 
+# The output chain is the half of the kill switch that stops THIS box leaking,
+# and the portal probe is this box's own traffic. Probed through it, the answer
+# can only ever be "no HTTP path", which converge then read as a dead uplink -
+# and the operator was told "peer or key problem, not a portal" while standing
+# behind a login page. Measured 2026-09-05, and it cost the whole first night.
+#
+# So the probe runs with the output chain open. Only the output chain: the
+# forward chain is untouched, so clients stay exactly as restricted as they
+# were. Whatever follows - apply_firewall in converge, reapply_firewall here -
+# rebuilds the chain in full, so the opening lasts as long as the probe.
+output_guard_open() {
+  nft list chain inet rasputin output >/dev/null 2>&1 || return 0
+  nft add chain inet rasputin output '{ type filter hook output priority 0; policy accept; }' 2>/dev/null || true
+  nft flush chain inet rasputin output 2>/dev/null || true
+}
+
 portal_check() {
-  local rc=0
+  local rc=0 reapply=0
+  if nft list chain inet rasputin output 2>/dev/null | grep -q 'policy drop'; then
+    reapply=1; output_guard_open
+  fi
   portal_probe || rc=$?
+  if (( reapply )); then
+    reapply_firewall || echo "rasputin: WARNING - could not re-arm the output guard after the probe" >&2
+  fi
   case $rc in
     0) echo "captive portal: none - this network is clear" ;;
     1) echo "captive portal: DETECTED"
@@ -1024,6 +1091,7 @@ portal_open() {
   } > "$PORTAL_STATE"
 
   converge
+  profile=$(cat "$STATE" 2>/dev/null || echo "$profile")
   pin_uplink_mac "$PORTAL_UPLINK"
 
   echo ""
@@ -1083,7 +1151,10 @@ EOF
 
 converge() {
   local profile; profile=$(cat "$STATE" 2>/dev/null) || die "no declared profile at $STATE - run: rasputin <profile>"
-  local MODE VPN MACRAND; resolve_profile "$profile"
+  local MODE VPN MACRAND PROFILE_NAME; resolve_profile "$profile"
+  # A mode word left in the state file is rewritten to the profile it means, so
+  # status never has to print it again.
+  if [[ $PROFILE_NAME != "$profile" ]]; then echo "$PROFILE_NAME" > "$STATE"; profile="$PROFILE_NAME"; fi
   local mode="$MODE"
   local portal=0
   # A marker whose window has passed is stale - reap it here rather than let a
@@ -1172,6 +1243,7 @@ converge() {
   # are trying to diagnose.
   vpn_stop
   if [[ $VPN == 1 ]]; then
+    output_guard_open
     local _rc=0; portal_probe || _rc=$?
     case $_rc in
       # Arming the kill switch around a tunnel that can never handshake locks
@@ -1257,9 +1329,21 @@ converge() {
 # refresh re-applies the gate for the address the uplink has NOW and does
 # nothing else: no MAC change, no reassociation, no service restart. That is
 # what makes it cheap enough to hang off a DHCP event.
+# The firewall for the profile as declared and the uplink as it is now. Shared
+# by refresh and by anything that has to put the output guard back after
+# opening it for a probe.
+reapply_firewall() {
+  local profile; profile=$(cat "$STATE" 2>/dev/null) || die "no declared profile at $STATE"
+  local MODE VPN MACRAND PROFILE_NAME; resolve_profile "$profile"
+  local portal=0
+  if portal_active; then portal=1; VPN=0; fi
+  local uplink; [[ $MODE == serve ]] && uplink="$WIFI" || uplink="$ETH"
+  apply_firewall "$uplink" "$MODE" "$VPN" "$portal"
+}
+
 refresh() {
   local profile; profile=$(cat "$STATE" 2>/dev/null) || die "no declared profile at $STATE"
-  local MODE VPN MACRAND; resolve_profile "$profile"
+  local MODE VPN MACRAND PROFILE_NAME; resolve_profile "$profile"
   local portal=0
   if portal_active; then portal=1; VPN=0; fi
   local uplink; [[ $MODE == serve ]] && uplink="$WIFI" || uplink="$ETH"
@@ -1271,6 +1355,12 @@ refresh() {
     || die "firewall apply failed; previous ruleset left intact"
   flush_stale_nat
   echo "rasputin: firewall refreshed for $uplink $(ip -4 -o addr show dev "$uplink" | awk '{print $4}' | head -1)"
+  # A new lease under a tunnel profile with no handshake is the shape of a
+  # captive portal appearing under the box - a venue moved onto, or a login
+  # that expired overnight. The kill switch is doing its job; say what to do.
+  if [[ $VPN == 1 ]] && ! wg_handshake_ok 1; then
+    echo "rasputin: WARNING - $VPN_IF has no handshake, so clients have no egress. A captive portal is the usual cause: rasputin portal --check" >&2
+  fi
 }
 
 # Masquerade bindings outlive the address they were built from. When the uplink
@@ -1307,7 +1397,9 @@ portal_status_line() {
 mac_status_line() {
   local ifc="$1" cur p_if p_mac
   cur=$(cat "/sys/class/net/$ifc/address" 2>/dev/null || echo '?')
-  if [[ -f $MAC_PIN ]] && read -r p_if p_mac < "$MAC_PIN" && [[ $p_if == "$ifc" ]]; then
+  # Three fields, the last of which is the SSID and may contain spaces. Reading
+  # two glued the SSID onto the MAC and every pinned status read NOT APPLIED.
+  if [[ -f $MAC_PIN ]] && read -r p_if p_mac _ < "$MAC_PIN" && [[ $p_if == "$ifc" ]]; then
     [[ $p_mac == "$cur" ]] && echo "$cur PINNED" || echo "$cur PIN $p_mac NOT APPLIED"
   # An unpinned MAC is no longer the same as a random one: a profile can decline
   # to randomise, and the supplicant's own setting is what decides whether the
@@ -1332,13 +1424,8 @@ upstream_status_line() {
 status() {
   # The uplink is derived from the declared profile, not from the routing
   # table: with the tunnel up the default route names wg0, not the leg it rides.
-  local smode=serve
-  case "$(cat "$STATE" 2>/dev/null)" in
-{% for name, p in rasputin_profiles.items() %}
-    {{ name }}) smode={{ p.mode }} ;;
-{% endfor %}
-    uplink|wan) smode=uplink ;;
-  esac
+  local MODE VPN MACRAND PROFILE_NAME smode=serve
+  profile_lookup "$(cat "$STATE" 2>/dev/null)" && smode=$MODE
   local supl; [[ $smode == serve ]] && supl="$WIFI" || supl="$ETH"
   echo "profile       : $(cat "$STATE" 2>/dev/null || echo '<unset>')"
   echo "portal        : $(portal_status_line)"
@@ -1379,15 +1466,13 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Names describe which way eth0 FACES, not whose WAN it is. "wan" was
-# ambiguous: eth0 being "the WAN for UniFi" means eth0 SERVES. Old names
-# remain as aliases so muscle memory keeps working.
 case "$cmd" in
 {% for name in rasputin_profiles.keys() %}
   {{ name }})  echo {{ name }} > "$STATE"; portal_close; converge ;;
 {% endfor %}
-  serve|lan)   echo serve  > "$STATE"; portal_close; converge ;;
-  uplink|wan)  echo uplink > "$STATE"; portal_close; converge ;;
+{% for alias, target in legacy_profile_aliases.items() %}
+  {{ alias }}) die "'{{ alias }}' is a mode word, not a profile: it said which way {{ eth_if }} faced and nothing about the tunnel.\n  the profile that means the same:  rasputin {{ target }}\n  all profiles: {{ rasputin_profiles.keys()|join(' ') }}" ;;
+{% endfor %}
   # Naming a profile is how you LEAVE portal mode. Bare `converge` is not:
   # that is what boot runs, and a reboot must not silently drop the window.
   converge) converge ;;
@@ -1403,5 +1488,5 @@ case "$cmd" in
   confirm)  cancel_rollback ;;
   rollback-fire) rollback_fire ;;
   status)   status ;;
-  *) die "usage: rasputin {{'{'}}{{ rasputin_profiles.keys()|join('|') }}|serve|uplink|converge|refresh|confirm|status|portal|mac-new|join|forget{{'}'}}\n              [--rollback SECS] [--for SECS] [--check] [--scan]\n  serve   = {{ eth_if }} FEEDS the wired net (this is UniFi WAN)\n  uplink  = {{ eth_if }} TAKES an address from the venue\n  refresh = re-apply the firewall for the uplink's current address\n  portal  = open a bounded hole to clear a captive portal (--check only probes)\n  mac-new = drop the pinned uplink MAC and take a fresh identity\n  join    = join a venue wifi: join <ssid> [passphrase], or --scan to list\n  forget  = drop a network that join wrote: forget <ssid>" ;;
+  *) die "usage: rasputin {{'{'}}{{ rasputin_profiles.keys()|join('|') }}|converge|refresh|confirm|status|portal|mac-new|join|forget{{'}'}}\n              [--rollback SECS] [--for SECS] [--check] [--scan]\n  profile = which leg faces the venue + whether a tunnel is required;\n            {{ eth_if }} serves the wired net unless it IS the uplink\n  refresh = re-apply the firewall for the uplink's current address\n  portal  = open a bounded hole to clear a captive portal (--check only probes)\n  mac-new = drop the pinned uplink MAC and take a fresh identity\n  join    = join a venue wifi: join <ssid> [passphrase], or --scan to list\n  forget  = drop a network that join wrote: forget <ssid>" ;;
 esac

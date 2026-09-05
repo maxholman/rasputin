@@ -27,7 +27,8 @@ eth_dhcp_end: 200
 # snippets. There is deliberately no secondary: a public fallback would be a
 # standing bypass around the blocklist, the DoH upstream and the kill switch.
 
-default_mode: serve
+# Seed only: the box's own state file wins from the first converge on.
+default_profile: home
 
 # Admin plane. SSH is permitted only on interfaces acting as LAN in the current
 # mode. Setting this true also exposes SSH on the uplink - i.e. to the hotel.
@@ -107,8 +108,7 @@ ap_device_timeout: 20
 # ---------------------------------------------------------------------------
 # Venue profiles. One word sets WAN leg + VPN state + DNS upstream together,
 # because setting them independently at midnight in a hotel is how you get it
-# wrong. mode=serve means eth0 FEEDS a downstream network; mode=uplink means
-# eth0 CONSUMES the venue's.
+# wrong.
 # ---------------------------------------------------------------------------
 #
 # randomize_mac is per profile because a fresh identity is only worth its cost
@@ -116,10 +116,29 @@ ap_device_timeout: 20
 # nobody, logs nothing, and hands a new MAC a new lease - often on a new subnet
 # - which renumbers the uplink on every converge and every boot for no gain.
 # Omitted, it follows randomize_client_mac.
+#
+# Two axes. `uplink` names the leg that faces the venue; `vpn` says whether
+# anything may leave except through the tunnel. eth0's role follows from the
+# first - a client when it is the uplink, a LAN leg otherwise - and an
+# unplugged LAN leg has nobody to serve, so it stays out of the way. There is
+# no mode word: "serve" said which way eth0 faced and nothing about the tunnel,
+# which is how the box spent a night on venue wifi with no VPN under a name
+# that said nothing of the kind.
 rasputin_profiles:
-  home: { mode: serve, vpn: false, randomize_mac: false } # 5G hotspot upstream, no tunnel
-  hotel-wifi: { mode: serve, vpn: true, randomize_mac: true } # venue wifi upstream, tunnel + killswitch
-  hotel-eth: { mode: uplink, vpn: true, randomize_mac: true } # venue ethernet upstream, tunnel + killswitch
+  home:             { uplink: wlan0, vpn: false, randomize_mac: false } # own 5G hotspot, no tunnel
+  hotel-wifi:       { uplink: wlan0, vpn: true }   # venue wifi, tunnel + kill switch
+  hotel-wifi-novpn: { uplink: wlan0, vpn: false }  # venue wifi in the clear: portal cleared, no tunnel wanted
+  hotel-eth:        { uplink: eth0,  vpn: true }   # venue ethernet, tunnel + kill switch
+  hotel-eth-novpn:  { uplink: eth0,  vpn: false }  # venue ethernet in the clear
+
+# The mode words from before profiles, and what each meant. rasputin reads them
+# from an old state file and rewrites it; typed, it refuses them and names the
+# profile instead.
+legacy_profile_aliases:
+  serve: hotel-wifi-novpn
+  lan: hotel-wifi-novpn
+  uplink: hotel-eth-novpn
+  wan: hotel-eth-novpn
 
 vpn_interface: wg0
 
@@ -166,7 +185,16 @@ blocky_upstream_strategy: parallel_best
 # Bootstraps the hostname above. Must be an IP-addressed DoH endpoint or we
 # would need a plaintext query to get started; the Cloudflare certificate
 # carries IP SANs for exactly this.
-blocky_bootstrap: https://1.1.1.2/dns-query
+#
+# More than one, because a venue can hijack a single address. Measured
+# 2026-09-05: a hotel firewall answered TLS to 1.1.1.1 and 1.1.1.2 with its own
+# certificate while 1.0.0.2 and Quad9 passed untouched, and with one bootstrap
+# that meant no blocklists for the stay. Quad9 has no IP SANs, so its IPs are
+# given beside the name.
+blocky_bootstrap:
+  - { upstream: https://1.0.0.2/dns-query }
+  - { upstream: https://1.1.1.2/dns-query }
+  - { upstream: https://dns.quad9.net/dns-query, ips: [9.9.9.9, 149.112.112.112] }
 blocky_upstream_timeout: 3s
 
 # Security only. Ads and trackers are handled on-device; adult and gambling
