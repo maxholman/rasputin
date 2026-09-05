@@ -27,12 +27,13 @@ stays out of the way.
 | profile | uplink | tunnels + kill switch | `eth0` |
 |---|---|---|---|
 | `home` | `wlan0` → own hotspot | none | serves the wired net |
-| `hotel-wifi` | `wlan0` → venue wifi | **two**: `wg1` for everything, `wg0` for the split domains | serves the wired net |
+| `hotel-wifi` | `wlan0` → venue wifi | **one**: `wg0` carries everything | serves the wired net |
+| `hotel-split` | `wlan0` → venue wifi | **two**: `wg0` for everything, `wgsg` for the split domains | serves the wired net |
 | `hotel-wifi-novpn` | `wlan0` → venue wifi | none | serves the wired net |
-| `hotel-eth` | `eth0` → venue ethernet | **two**, as above | is the uplink |
+| `hotel-eth` | `eth0` → venue ethernet | **one**: `wg0` carries everything | is the uplink |
 | `hotel-eth-novpn` | `eth0` → venue ethernet | none | is the uplink |
 
-Two tunnels because one exit is rarely right for everything: a near exit is
+A second tunnel because one exit is rarely right for everything: a near exit is
 fast for the bulk of the traffic, and a far one is for the services that
 refuse the near one (from Hong Kong, that is Claude and OpenAI). The split is
 by domain, the way UniFi does it: blocky forwards `split_domains` to dnsmasq,
@@ -43,6 +44,14 @@ the clear, so the kill switch is exactly as tight as with one tunnel. A client
 running its own DoH is not classified and exits with everything else. Each
 tunnel is a Proton WireGuard config in `/etc/wireguard/<name>.conf`; the role
 never carries those keys, so they are copied onto the box by hand.
+
+Both tunnels come off one Proton account, so they share an address (`10.2.0.2`)
+and a resolver (`10.2.0.1`). That is survivable, but only because `split_start`
+widens the anti-spoof rule wg-quick installs for the default tunnel — untouched,
+that rule drops every reply the second tunnel receives, and the symptom is a
+tunnel that handshakes in two seconds and never carries a byte. The default
+tunnel must be an exit where the split domains still work: every fallback path
+lands there.
 
 There is no mode word to type. `serve` and `uplink` used to say which way
 `eth0` faced and nothing about the tunnel, which is how the box spent a night

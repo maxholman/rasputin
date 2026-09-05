@@ -127,6 +127,7 @@ ap_device_timeout: 20
 rasputin_profiles:
   home:             { uplink: wlan0, vpn: false, randomize_mac: false } # own 5G hotspot, no tunnel
   hotel-wifi:       { uplink: wlan0, vpn: true }   # venue wifi, single tunnel (wg0) + kill switch
+  hotel-split:      { uplink: wlan0, vpn: { default: wg0, domains: wgsg } } # as above + a second tunnel for split_domains
   hotel-wifi-novpn: { uplink: wlan0, vpn: false }  # venue wifi in the clear: portal cleared, no tunnel wanted
   hotel-eth:        { uplink: eth0,  vpn: true }   # venue ethernet, single tunnel (wg0) + kill switch
   hotel-eth-novpn:  { uplink: eth0,  vpn: false }  # venue ethernet in the clear
@@ -147,7 +148,16 @@ vpn_interface: wg0
 # only split_domains. The near exit is fast for the bulk of the traffic; the
 # far exit is for the services that refuse the near one - from Hong Kong, that
 # is these. Both are tunnels, so the kill switch is exactly as tight as with
-# one. The classifier is DNS: blocky forwards these names to dnsmasq, which
+# one.
+#
+# CHOOSE X SO THAT THE SPLIT DOMAINS STILL WORK THROUGH IT. Every fallback
+# lands on X - converge withdraws the steering when Y will not handshake, and a
+# name blocky cached before Y died leaves by X too - so an X where these names
+# are blocked turns any wobble on Y into an outage on exactly the domains the
+# split exists to protect. This is why the first two attempts hurt: X was the
+# near exit, and the near exit was Hong Kong.
+#
+# The classifier is DNS: blocky forwards these names to dnsmasq, which
 # answers them from split_dns_upstream (Proton's resolver, reachable only
 # inside tunnel Y) and writes every address into the nftables set the mangle
 # rule marks on. A client running its own DoH bypasses the classifier and

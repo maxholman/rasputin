@@ -1042,6 +1042,44 @@ split_start() {
   # Replies arrive on this interface for flows the main table would send
   # elsewhere; strict reverse-path filtering would drop every one of them.
   sysctl -qw "net.ipv4.conf.$ifc.rp_filter=2" 2>/dev/null || true
+  split_unspoof
+}
+
+# wg-quick guards the default tunnel's own address with a prerouting rule:
+#
+#   iifname != "wg0" ip daddr 10.2.0.2 fib saddr type != local drop
+#
+# Anything addressed to that tunnel's address that did not arrive on that
+# tunnel is forged, so it dies at priority raw - before conntrack, before any
+# rule in table inet rasputin, before anything that could log it.
+#
+# Every Proton config on one account carries the SAME address whatever the
+# country, so the second tunnel's replies match that rule exactly. This is what
+# broke the split twice, and it is worth knowing the shape of it: the far
+# tunnel handshakes in two seconds, its peer answers, the replies reach the
+# interface - and not one byte ever reaches a socket. It reads like the far
+# exit is refusing to carry traffic, which is why the sharing of an address got
+# the blame and the split got parked as impossible. It is not impossible.
+#
+# The guard is still worth having against the venue, so widen it to our own
+# tunnels rather than delete it. Re-read from the live rule each time: wg-quick
+# rebuilds this table on every up, and it is the only thing that knows which
+# addresses it decided to protect.
+split_unspoof() {
+  local tbl="wg-quick-$VPN_IF" fam addrs a
+  for fam in ip ip6; do
+    nft list table "$fam" "$tbl" >/dev/null 2>&1 || continue
+    addrs=$(nft list chain "$fam" "$tbl" preraw 2>/dev/null \
+            | sed -n "s/.*$fam daddr \([^ ]*\) fib.*/\1/p")
+    [[ -n $addrs ]] || continue
+    nft flush chain "$fam" "$tbl" preraw
+    for a in $addrs; do
+      nft add rule "$fam" "$tbl" preraw \
+        iifname != "{ \"$VPN_IF\", \"$VPN_SPLIT_IF\" }" \
+        "$fam" daddr "$a" fib saddr type != local drop \
+        || echo "rasputin: WARNING - could not widen wg-quick's anti-spoof guard for $a; $VPN_SPLIT_IF will receive nothing" >&2
+    done
+  done
 }
 
 vpn_stop() {
@@ -1435,8 +1473,15 @@ converge() {
     wg_handshake_ok "$VPN_IF" 20 \
       || echo "rasputin: WARNING - no $VPN_IF handshake, but the network probed clear - peer or key problem, not a portal" >&2
     if [[ -n $VPN_SPLIT_IF ]]; then
-      wg_handshake_ok "$VPN_SPLIT_IF" 20 \
-        || echo "rasputin: WARNING - no $VPN_SPLIT_IF handshake; the split domains have no exit until it does" >&2
+      # An interface that is up but never handshakes is a black hole, and the
+      # names pointed into it are the ones this box exists to reach. Withdraw
+      # the steering rather than steer into nothing: the split domains then
+      # leave by the default tunnel, which is worse routing and not an outage.
+      # The mark is still set, but with no rule for it it decides nothing.
+      if ! wg_handshake_ok "$VPN_SPLIT_IF" 20; then
+        ip rule del pref 100 2>/dev/null || true
+        echo "rasputin: WARNING - no $VPN_SPLIT_IF handshake; steering WITHDRAWN, the split domains leave via $VPN_IF" >&2
+      fi
     fi
   fi
 
