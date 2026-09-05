@@ -128,6 +128,11 @@ rasputin_profiles:
   home:             { uplink: wlan0, vpn: false, randomize_mac: false } # own 5G hotspot, no tunnel
   hotel-wifi:       { uplink: wlan0, vpn: true }   # venue wifi, single tunnel (wg0) + kill switch
   hotel-split:      { uplink: wlan0, vpn: { default: wg0, domains: wgsg } } # as above + a second tunnel for split_domains
+  # The venue answer for Hong Kong: a local exit for everything, because the
+  # job is to leave the hotel's network and not the country, and Singapore for
+  # the names Hong Kong cannot serve. fallback: false because it cannot serve
+  # them at all - measured, see split_domains below.
+  hotel-hk:         { uplink: wlan0, vpn: { default: wghk, domains: wgsg, fallback: false } }
   hotel-wifi-novpn: { uplink: wlan0, vpn: false }  # venue wifi in the clear: portal cleared, no tunnel wanted
   hotel-eth:        { uplink: eth0,  vpn: true }   # venue ethernet, single tunnel (wg0) + kill switch
   hotel-eth-novpn:  { uplink: eth0,  vpn: false }  # venue ethernet in the clear
@@ -150,12 +155,22 @@ vpn_interface: wg0
 # is these. Both are tunnels, so the kill switch is exactly as tight as with
 # one.
 #
-# CHOOSE X SO THAT THE SPLIT DOMAINS STILL WORK THROUGH IT. Every fallback
-# lands on X - converge withdraws the steering when Y will not handshake, and a
-# name blocky cached before Y died leaves by X too - so an X where these names
-# are blocked turns any wobble on Y into an outage on exactly the domains the
-# split exists to protect. This is why the first two attempts hurt: X was the
-# near exit, and the near exit was Hong Kong.
+# Every fallback lands on X - converge withdraws the steering when Y will not
+# handshake, and a name blocky cached before Y died leaves by X too. Where X
+# cannot serve these names, say so with `fallback: false`: the steering is then
+# kept even when Y is down, so the names fail against the tunnel that is
+# actually broken instead of against a region block that will never lift.
+#
+# From Hong Kong they cannot. Measured 2026-09-05 through a clean Proton HK
+# exit, so this is Anthropic and OpenAI refusing the region, not the hotel:
+#
+#   claude.ai         302 -> https://www.anthropic.com/app-unavailable-in-region
+#   api.anthropic.com 403 {"type":"forbidden","message":"Request not allowed"}
+#
+# The same request answers 401 (i.e. reaches the API) through Taiwan and
+# Singapore. This is what made the first two attempts look like a routing
+# fault: the split's fallback was Hong Kong, so every wobble on Y produced a
+# region block, which reads like nothing at all.
 #
 # The classifier is DNS: blocky forwards these names to dnsmasq, which
 # answers them from split_dns_upstream (Proton's resolver, reachable only

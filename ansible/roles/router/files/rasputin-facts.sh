@@ -5,7 +5,7 @@
 s(){ printf '\n-----8<----- %s\n' "$1"; }
 s rasputin;  /usr/local/sbin/rasputin status 2>&1
 s wan
-ip -4 route get 1.1.1.1 2>&1 | head -1
+ip -4 route get 1.0.0.1 2>&1 | head -1
 gw=$(ip -4 route show default 2>/dev/null | awk '{print $3; exit}')
 if [ -z "$gw" ]; then echo "gw none"
 elif nft list chain inet rasputin output 2>/dev/null | grep -q 'policy drop'; then echo "gw $gw unprobed"
@@ -13,7 +13,12 @@ elif rtt=$(ping -c 1 -W 2 "$gw" 2>/dev/null | awk -F'time=' '/time=/{split($2,a,
 else echo "gw $gw unreachable"
 fi
 t0=$(date +%s%3N)
-if timeout 2 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' 2>/dev/null; then echo "tcp443 open $(( $(date +%s%3N) - t0 ))"; else echo "tcp443 no-path"; fi
+# 1.0.0.1, not the 1.1.1.1 measured being terminated here (see below): a bare
+# TCP connect has no certificate to check, so a venue that answers the address
+# makes this row read "internet ✓" with no internet behind it. The kill switch
+# drops the probe entirely, but a -novpn profile or an open portal window does
+# not - which is when this row is read to decide whether the portal cleared.
+if timeout 2 bash -c 'exec 3<>/dev/tcp/1.0.0.1/443' 2>/dev/null; then echo "tcp443 open $(( $(date +%s%3N) - t0 ))"; else echo "tcp443 no-path"; fi
 # Two addresses, because a venue firewall can hijack one and not the other -
 # measured 2026-09-05: 1.1.1.1 answered with the hotel's own certificate while
 # 1.0.0.1 passed clean, and the status tool showed a portal for the whole stay.

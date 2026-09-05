@@ -197,9 +197,9 @@ struct Status {
     hostname: String,
     uptime_secs: u64,
     rasputin: HashMap<String, String>, // "profile", "vpn (wg0)", ...
-    wan_path: String,       // `ip route get 1.1.1.1`, first line
+    wan_path: String,       // `ip route get 1.0.0.1`, first line
     wan_gw: String,  // "10.31.0.1 reachable 1.2" (ms) | "... unreachable" | "... unprobed" | "none"
-    wan_tcp: String,   // TCP 1.1.1.1:443 from the box: "open 34" (ms) | "no-path"
+    wan_tcp: String,   // TCP 1.0.0.1:443 from the box: "open 34" (ms) | "no-path"
     wan_extip: String, // per https://1.1.1.1/cdn-cgi/trace; "" if unreachable, "nocurl" if no curl
     ifaces: HashMap<String, String>, // name → `ip -br addr` remainder: "UP 10.6.141.1/24 ..."
     // Since-boot byte counters straight from /proc/net/dev, and the per-second
@@ -1042,9 +1042,9 @@ fn build_lines(
             .and_then(|r| r.split_whitespace().next())
             .unwrap_or("?");
         let lat = if ms.trim().is_empty() { String::new() } else { format!(" · {} ms", ms.trim()) };
-        (format!("1.1.1.1:443 via {via}{lat} ✓"), false)
+        (format!("1.0.0.1:443 via {via}{lat} ✓"), false)
     } else {
-        ("1.1.1.1:443 NO PATH".to_string(), true)
+        ("1.0.0.1:443 NO PATH".to_string(), true)
     };
     lines.push(kv("internet", inet.0, pick(inet.1)));
     let extip = match st.wan_extip.as_str() {

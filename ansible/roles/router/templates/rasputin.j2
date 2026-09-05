@@ -93,6 +93,14 @@ apply_firewall() {
   # Two tunnels are one exit as far as the kill switch is concerned.
   local egress_match="\"$egress\""
   [[ $vpn == 1 && -n $VPN_SPLIT_IF ]] && egress_match="{ \"$VPN_IF\", \"$VPN_SPLIT_IF\" }"
+  # This rebuild strips every rule that made a split work, so where the profile
+  # no longer has one the steering rule has to go with them. It reads as
+  # belt-and-braces and is not: the profile is written to $STATE before converge
+  # runs, so a converge that dies partway - or any later refresh - rebuilds the
+  # ruleset as a single tunnel while the ip rule, the interface and the
+  # resolver mapping all survive. Marked traffic then goes to an interface
+  # nothing maintains any more, and nothing anywhere says so.
+  if [[ -z $VPN_SPLIT_IF ]]; then ip rule del pref 100 2>/dev/null || true; fi
   if [[ $mode == serve ]]; then lan_list="\"$ETH\", \"$AP\""; else lan_list="\"$AP\""; fi
   admin_list="$lan_list"
 {% if admin_on_uplink | default(false) | bool %}
@@ -944,6 +952,12 @@ VPN_IF={{ vpn_interface }}
 # Set per profile by profile_lookup. A profile may carry a second tunnel that
 # takes only the split domains; see split_start for the whole mechanism.
 VPN_SPLIT_IF=""
+# Whether the split domains may leave by the DEFAULT tunnel when the split one
+# is not carrying them. False where the default exit cannot serve those names
+# at all - a Hong Kong exit and Claude, say, which Anthropic refuses by region.
+# There the fallback is not degraded service, it is a different failure wearing
+# the same face, so it is better not to have one.
+VPN_SPLIT_FALLBACK=1
 SPLIT_TABLE={{ split_table }}
 SPLIT_MARK={{ split_mark }}
 SPLIT_DNS={{ split_dns_upstream }}
@@ -965,7 +979,7 @@ profile_lookup() {
   PROFILE_NAME="$1"
   case "$1" in
 {% for name, p in rasputin_profiles.items() %}
-    {{ name }}) MODE={{ 'uplink' if p.uplink == eth_if else 'serve' }}; VPN={{ 1 if p.vpn else 0 }}; VPN_IF={{ p.vpn.default if p.vpn is mapping else vpn_interface }}; VPN_SPLIT_IF="{{ p.vpn.domains if p.vpn is mapping else '' }}"; MACRAND={{ 1 if p.randomize_mac | default(true) else 0 }} ;;
+    {{ name }}) MODE={{ 'uplink' if p.uplink == eth_if else 'serve' }}; VPN={{ 1 if p.vpn else 0 }}; VPN_IF={{ p.vpn.default if p.vpn is mapping else vpn_interface }}; VPN_SPLIT_IF="{{ p.vpn.domains if p.vpn is mapping else '' }}"; VPN_SPLIT_FALLBACK={{ 0 if (p.vpn is mapping and p.vpn.fallback is defined and not p.vpn.fallback) else 1 }}; MACRAND={{ 1 if p.randomize_mac | default(true) else 0 }} ;;
 {% endfor %}
 {% for alias, target in legacy_profile_aliases.items() %}
     {{ alias }}) profile_lookup {{ target }} ;;
@@ -1474,13 +1488,18 @@ converge() {
       || echo "rasputin: WARNING - no $VPN_IF handshake, but the network probed clear - peer or key problem, not a portal" >&2
     if [[ -n $VPN_SPLIT_IF ]]; then
       # An interface that is up but never handshakes is a black hole, and the
-      # names pointed into it are the ones this box exists to reach. Withdraw
-      # the steering rather than steer into nothing: the split domains then
-      # leave by the default tunnel, which is worse routing and not an outage.
-      # The mark is still set, but with no rule for it it decides nothing.
+      # names pointed into it are the ones this box exists to reach. Where the
+      # default tunnel can serve them, withdraw the steering rather than steer
+      # into nothing - worse routing beats an outage. Where it cannot, keep the
+      # steering: sending these names to an exit that refuses them by region
+      # buys nothing and costs the one clue that says which tunnel is at fault.
       if ! wg_handshake_ok "$VPN_SPLIT_IF" 20; then
-        ip rule del pref 100 2>/dev/null || true
-        echo "rasputin: WARNING - no $VPN_SPLIT_IF handshake; steering WITHDRAWN, the split domains leave via $VPN_IF" >&2
+        if [[ $VPN_SPLIT_FALLBACK == 1 ]]; then
+          ip rule del pref 100 2>/dev/null || true
+          echo "rasputin: WARNING - no $VPN_SPLIT_IF handshake; steering WITHDRAWN, the split domains leave via $VPN_IF" >&2
+        else
+          echo "rasputin: WARNING - no $VPN_SPLIT_IF handshake, and $VPN_IF cannot serve the split domains; steering KEPT, those names stay down until it returns" >&2
+        fi
       fi
     fi
   fi
