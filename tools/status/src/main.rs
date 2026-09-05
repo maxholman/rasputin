@@ -1243,7 +1243,14 @@ fn run_tui(opts: &Opts, host: String, sudo_pw: Option<String>) {
                     (Some(e), _) => Line::from(Span::styled(format!(" {e}"), bad)),
                     (None, Some(t)) => {
                         let age = t.elapsed().as_secs();
-                        if age > interval.as_secs() * 3 {
+                        // A single slow poll must not read as stale. One poll
+                        // is an SSH round-trip to the Pi that runs a probe
+                        // script, and over a laggy hotel link through the
+                        // tunnel that can take several seconds - longer than a
+                        // 2s tick. Warn only when data has genuinely stopped,
+                        // never merely because the last poll was slow.
+                        let thresh = (interval.as_secs() * 3).max(20);
+                        if age > thresh {
                             Line::from(Span::styled(format!(" stale: last data {age}s ago"), bad))
                         } else {
                             Line::from(Span::styled(
