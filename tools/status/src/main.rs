@@ -433,16 +433,19 @@ fn dns_query_a(server: &str, domain: &str) -> Result<(Vec<String>, u128, u8), St
 // ---------------------------------------------------------------------------
 // Interpretation
 
-/// What the declared profile promises: Some(true) = tunnel + kill switch,
-/// Some(false) = open egress, None = unknown profile, state facts only.
-fn vpn_expected(profile: &str) -> Option<bool> {
-    match profile {
-        // The bare mode words are what an old state file may still say until
-        // its next converge rewrites it; they never promised a tunnel.
-        "home" | "hotel-wifi-novpn" | "hotel-eth-novpn" | "serve" | "lan" | "uplink" | "wan" => Some(false),
-        "hotel-wifi" | "hotel-eth" => Some(true),
-        _ => None,
-    }
+/// The tunnels the declared profile requires, as rasputin itself reports them
+/// in the `vpn required` line. Empty = the profile promises open egress. None =
+/// a rasputin too old to say, so nothing is judged. Read from the box rather
+/// than from a table of profile names here, so that adding or reshaping a
+/// profile in the role cannot leave this tool judging against a stale idea.
+fn tunnels_required(st: &Status) -> Option<Vec<String>> {
+    let v = st.rasputin.get("vpn required")?;
+    Some(if v == "none" { vec![] } else { v.split_whitespace().map(String::from).collect() })
+}
+
+/// Some(true) = tunnel + kill switch, Some(false) = open egress, None = unknown.
+fn vpn_expected(st: &Status) -> Option<bool> {
+    tunnels_required(st).map(|t| !t.is_empty())
 }
 
 /// The physical uplink leg each profile declares. wg0 rides on this, so it is
@@ -494,7 +497,7 @@ type ByteCounters = HashMap<String, (u64, u64)>;
 
 struct Port {
     role: &'static str,
-    iface: &'static str,
+    iface: String,
     state: PortState,
     addr: String,
     detail: String,
@@ -533,11 +536,44 @@ fn wifi_detail(link: &str) -> String {
     }
 }
 
+/// `wg show` for every interface, split into (name, block).
+fn wg_blocks(st: &Status) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for line in st.wg.lines() {
+        if let Some(n) = line.trim().strip_prefix("interface:") {
+            out.push((n.trim().to_string(), String::new()));
+        } else if let Some(last) = out.last_mut() {
+            last.1.push_str(line);
+            last.1.push('\n');
+        }
+    }
+    out
+}
+
+fn wg_field(block: &str, key: &str) -> Option<String> {
+    block.lines().find_map(|l| l.trim().strip_prefix(key).map(|v| v.trim().to_string()))
+}
+
 /// "latest handshake: 1 minute, 2 seconds ago" → "1 minute, 2 seconds ago"
-fn wg_handshake(st: &Status) -> Option<String> {
-    st.wg
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("latest handshake:").map(|v| v.trim().to_string()))
+fn wg_handshake(st: &Status, iface: &str) -> Option<String> {
+    wg_blocks(st).into_iter().find(|(n, _)| n == iface).and_then(|(_, b)| wg_field(&b, "latest handshake:"))
+}
+
+fn wg_port(st: &Status, iface: &str, state: PortState, detail: String) -> Port {
+    Port {
+        role: "vpn",
+        iface: iface.to_string(),
+        state,
+        addr: st
+            .ifaces
+            .get(iface)
+            .and_then(|r| r.split_whitespace().find(|a| a.contains('.')))
+            .unwrap_or("—")
+            .to_string(),
+        detail,
+        rate: st.rates.get(iface).copied(),
+        total: st.netdev.get(iface).copied(),
+    }
 }
 
 fn ports(st: &Status) -> Vec<Port> {
@@ -589,7 +625,7 @@ fn ports(st: &Status) -> Vec<Port> {
         };
         out.push(Port {
             role,
-            iface,
+            iface: iface.to_string(),
             state,
             addr,
             detail,
@@ -598,37 +634,40 @@ fn ports(st: &Status) -> Vec<Port> {
         });
     }
 
-    // wg0 is a port too. It is not a physical one, but it is where you look to
-    // ask "is my traffic protected", and that belongs beside the legs it rides
-    // on rather than in a section of its own.
-    let up = st.ifaces.contains_key("wg0");
-    let (state, detail) = match (vpn_expected(&profile), up) {
-        // Configured but deliberately unused here - NOT "not configured", which
-        // would send you hunting for a wg0.conf that is present and correct.
-        (Some(false), false) => (PortState::Unused, format!("not used by '{profile}'")),
-        (Some(false), true) => (PortState::NoAddr, format!("UP but '{profile}' declares no VPN")),
-        (Some(true), true) => (
-            PortState::Up,
-            wg_handshake(st).map(|h| format!("handshake {h}")).unwrap_or_else(|| "no handshake yet".into()),
-        ),
-        (Some(true), false) => (PortState::Down, format!("required by '{profile}'")),
-        (None, true) => (PortState::Unknown, "up".into()),
-        (None, false) => (PortState::Unknown, "down".into()),
-    };
-    out.push(Port {
-        role: "vpn",
-        iface: "wg0",
-        state,
-        addr: st
-            .ifaces
-            .get("wg0")
-            .and_then(|r| r.split_whitespace().find(|a| a.contains('.')))
-            .unwrap_or("—")
-            .to_string(),
-        detail,
-        rate: st.rates.get("wg0").copied(),
-        total: st.netdev.get("wg0").copied(),
-    });
+    // The tunnels are ports too. Not physical ones, but they are where you
+    // look to ask "is my traffic protected", and that belongs beside the legs
+    // they ride on. One row per tunnel the profile requires; a profile that
+    // requires none gets a single grey row so the absence is stated.
+    match tunnels_required(st) {
+        Some(req) if !req.is_empty() => {
+            for t in &req {
+                let (state, detail) = if st.ifaces.contains_key(t) {
+                    (
+                        PortState::Up,
+                        wg_handshake(st, t).map(|h| format!("handshake {h}")).unwrap_or_else(|| "no handshake yet".into()),
+                    )
+                } else {
+                    (PortState::Down, format!("required by '{profile}'"))
+                };
+                out.push(wg_port(st, t, state, detail));
+            }
+        }
+        Some(_) => {
+            // Configured but deliberately unused here - NOT "not configured",
+            // which would send you hunting for a wg0.conf that is present and
+            // correct. Up anyway is amber: something the profile did not ask for.
+            let mut present: Vec<&String> = st.ifaces.keys().filter(|k| k.starts_with("wg")).collect();
+            present.sort();
+            match present.first() {
+                Some(w) => out.push(wg_port(st, w, PortState::NoAddr, format!("UP but '{profile}' declares no VPN"))),
+                None => out.push(wg_port(st, "wg0", PortState::Unused, format!("not used by '{profile}'"))),
+            }
+        }
+        None => {
+            let up = st.ifaces.contains_key("wg0");
+            out.push(wg_port(st, "wg0", PortState::Unknown, if up { "up".into() } else { "down".into() }));
+        }
+    }
     out
 }
 
@@ -637,7 +676,8 @@ fn ports(st: &Status) -> Vec<Port> {
 /// `Some([])` = the box is doing what it said it would.
 fn faults(st: &Status) -> Option<Vec<String>> {
     let profile = st.rasputin.get("profile").cloned().unwrap_or_default();
-    let want_vpn = vpn_expected(&profile)?;
+    let required = tunnels_required(st)?;
+    let want_vpn = !required.is_empty();
     let mut f = Vec::new();
 
     // The uplink carries everything else, so it is named first when it is out.
@@ -652,8 +692,16 @@ fn faults(st: &Status) -> Option<Vec<String>> {
         }
     }
     if want_vpn {
-        if !st.ifaces.contains_key("wg0") {
-            f.push("wg0 DOWN - clients have no egress".into());
+        // The first tunnel carries everything; any after it carry only the
+        // split domains, so losing one of those is a narrower fault.
+        for (i, t) in required.iter().enumerate() {
+            if !st.ifaces.contains_key(t) {
+                f.push(if i == 0 {
+                    format!("{t} DOWN - clients have no egress")
+                } else {
+                    format!("{t} DOWN - split domains have no exit")
+                });
+            }
         }
         if !st.rasputin.get("output guard").map(|g| g.contains("drop")).unwrap_or(false) {
             f.push("kill switch NOT ARMED".into());
@@ -683,8 +731,6 @@ struct Judged {
 }
 
 fn judge(st: &Status) -> Judged {
-    let profile = st.rasputin.get("profile").cloned().unwrap_or_default();
-    let vpn_up = st.rasputin.get("vpn (wg0)").map(|v| v == "UP").unwrap_or(false);
     let guard_raw = st.rasputin.get("output guard").cloned().unwrap_or_else(|| "?".into());
     let guard_drop = guard_raw.contains("drop");
     let guard_word: String = if guard_drop {
@@ -695,9 +741,16 @@ fn judge(st: &Status) -> Judged {
         guard_raw.clone()
     };
 
-    match vpn_expected(&profile) {
-        Some(want) => {
-            let vpn_ok = vpn_up == want;
+    match tunnels_required(st) {
+        Some(req) => {
+            let want = !req.is_empty();
+            // Every required tunnel present, or - on a profile that wants none -
+            // no tunnel present at all.
+            let vpn_ok = if want {
+                req.iter().all(|t| st.ifaces.contains_key(t))
+            } else {
+                !st.ifaces.keys().any(|k| k.starts_with("wg"))
+            };
             let guard_ok = guard_drop == want;
             Judged {
                 guard: (
@@ -717,26 +770,19 @@ fn judge(st: &Status) -> Judged {
     }
 }
 
-fn wg_summary(st: &Status) -> Option<String> {
-    if st.wg.is_empty() {
-        return None;
-    }
-    let mut handshake = None;
-    let mut transfer = None;
-    for line in st.wg.lines() {
-        let line = line.trim();
-        if let Some(v) = line.strip_prefix("latest handshake:") {
-            handshake = Some(v.trim().to_string());
-        }
-        if let Some(v) = line.strip_prefix("transfer:") {
-            transfer = Some(v.trim().to_string());
-        }
-    }
-    match (handshake, transfer) {
-        (Some(h), Some(t)) => Some(format!("handshake {h} · {t}")),
-        (Some(h), None) => Some(format!("handshake {h}")),
-        _ => None,
-    }
+fn wg_summary(st: &Status) -> Vec<(String, String)> {
+    wg_blocks(st)
+        .into_iter()
+        .filter_map(|(name, block)| {
+            let h = wg_field(&block, "latest handshake:");
+            let t = wg_field(&block, "transfer:");
+            match (h, t) {
+                (Some(h), Some(t)) => Some((name, format!("handshake {h} · {t}"))),
+                (Some(h), None) => Some((name, format!("handshake {h}"))),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -786,7 +832,7 @@ fn build_lines(
         Span::styled(
             format!("  {profile}  "),
             Style::default()
-                .fg(match vpn_expected(&profile) {
+                .fg(match vpn_expected(st) {
                     Some(true) => Color::Magenta,
                     Some(false) => Color::Blue,
                     None => Color::DarkGray,
@@ -851,7 +897,7 @@ fn build_lines(
             Span::styled(
                 cells(
                     p.role,
-                    p.iface,
+                    &p.iface,
                     match p.state {
                         PortState::Up | PortState::NoAddr => "UP",
                         PortState::Down => "DOWN",
@@ -937,14 +983,24 @@ fn build_lines(
     // The VPN gets a section only where it has something to say. wg0's own
     // state is a port row now, so on a no-VPN profile there is nothing left
     // here worth four lines of screen.
-    if vpn_expected(&profile) != Some(false) {
+    if vpn_expected(st) != Some(false) {
         lines.push(section("VPN"));
         lines.push(kv("kill switch", j.guard.0.clone(), pick(j.guard.1)));
         if j.protected {
-            lines.push(kv("", "all egress via wg0".into(), good));
+            let via = tunnels_required(st).unwrap_or_default().join(" + ");
+            lines.push(kv("", format!("all egress via {via}"), good));
         }
-        if let Some(wg) = wg_summary(st) {
-            lines.push(kv("transfer", wg, dim));
+        for (name, text) in wg_summary(st) {
+            lines.push(kv(&name, text, dim));
+        }
+        // The split: which names take the second tunnel, and how many
+        // addresses the resolver has steered so far.
+        if let Some(d) = st.rasputin.get("split domains") {
+            let via = tunnels_required(st).and_then(|t| t.get(1).cloned()).unwrap_or_default();
+            lines.push(kv("split", format!("{d} → {via}"), dim));
+        }
+        if let Some(h) = st.rasputin.get("split hosts") {
+            lines.push(kv("steered", h.clone(), dim));
         }
         lines.push(kv(
             "egress",
@@ -1214,6 +1270,17 @@ mod tests {
     fn st(profile: &str) -> Status {
         let mut s = Status::default();
         s.rasputin.insert("profile".into(), profile.into());
+        // What rasputin's `vpn required` line says for each profile; an
+        // unknown profile is a rasputin that did not say.
+        match profile {
+            "hotel-wifi" | "hotel-eth" => {
+                s.rasputin.insert("vpn required".into(), "wg1 wg0".into());
+            }
+            "something-new" => {}
+            _ => {
+                s.rasputin.insert("vpn required".into(), "none".into());
+            }
+        }
         s.ifaces.insert("wlan0".into(), "UP 10.31.4.88/24 fe80::1/64".into());
         s.ifaces.insert("wlan1".into(), "UP 10.9.141.1/24".into());
         s.ifaces.insert("eth0".into(), "UP 10.6.141.1/24".into());
@@ -1252,10 +1319,11 @@ mod tests {
     #[test]
     fn roles_follow_the_profile() {
         let p = ports(&st("hotel-wifi"));
-        assert_eq!(p.iter().map(|p| p.role).collect::<Vec<_>>(), ["uplink", "ap", "lan", "vpn"]);
+        assert_eq!(p.iter().map(|p| p.role).collect::<Vec<_>>(), ["uplink", "ap", "lan", "vpn", "vpn"]);
+        assert_eq!(p.iter().map(|p| p.iface.as_str()).collect::<Vec<_>>(), ["wlan0", "wlan1", "eth0", "wg1", "wg0"]);
         // eth0 takes the WAN in hotel-eth, which leaves wlan0 with no job.
         let p = ports(&st("hotel-eth"));
-        assert_eq!(p.iter().map(|p| p.role).collect::<Vec<_>>(), ["—", "ap", "uplink", "vpn"]);
+        assert_eq!(p.iter().map(|p| p.role).collect::<Vec<_>>(), ["—", "ap", "uplink", "vpn", "vpn"]);
         assert!(p[0].state == PortState::Unused, "an idle leg must not read as a fault");
     }
 
@@ -1279,7 +1347,7 @@ mod tests {
         // tunnel actually reaches its peer.
         let mut s = st("hotel-wifi");
         s.ifaces.insert("wg0".into(), "UNKNOWN 10.2.0.2/32".into());
-        s.wg = "  latest handshake: 12 seconds ago\n  transfer: 1.2 GiB received".into();
+        s.wg = "interface: wg1\n  latest handshake: 3 seconds ago\ninterface: wg0\n  latest handshake: 12 seconds ago\n  transfer: 1.2 GiB received".into();
         let p = wg(&s);
         assert_eq!(p.state, PortState::Up);
         assert_eq!(p.detail, "handshake 12 seconds ago");
@@ -1299,14 +1367,17 @@ mod tests {
         // hotel-wifi promises a tunnel and a kill switch; this box has neither.
         let mut h = s.clone();
         h.rasputin.insert("profile".into(), "hotel-wifi".into());
+        h.rasputin.insert("vpn required".into(), "wg1 wg0".into());
         h.rasputin.insert("output guard".into(), "policy accept".into());
         let f = faults(&h).unwrap();
-        assert!(f.iter().any(|x| x.contains("wg0 DOWN")), "{f:?}");
+        assert!(f.iter().any(|x| x.contains("wg1 DOWN - clients have no egress")), "{f:?}");
+        assert!(f.iter().any(|x| x.contains("wg0 DOWN - split domains have no exit")), "{f:?}");
         assert!(f.iter().any(|x| x.contains("kill switch NOT ARMED")), "{f:?}");
 
-        // An unknown profile promises nothing, so nothing is judged.
+        // A rasputin that does not say what it requires gets no judgement.
         let mut u = s.clone();
         u.rasputin.insert("profile".into(), "something-new".into());
+        u.rasputin.remove("vpn required");
         assert_eq!(faults(&u), None);
     }
 
@@ -1343,7 +1414,12 @@ mod tests {
             .iter()
             .position(|l| l.iter().map(|s| s.content.as_ref()).collect::<String>().trim() == "INTERFACES")
             .expect("panel is rendered");
-        lines[start + 2..start + 6].to_vec() // skip the section title and the column header
+        // skip the section title and the column header, then every row up to the blank line
+        lines[start + 2..]
+            .iter()
+            .take_while(|l| !l.iter().map(|s| s.content.as_ref()).collect::<String>().trim().is_empty())
+            .cloned()
+            .collect()
     }
 
     /// The lamp is the only span that is exactly two blank cells.
@@ -1360,8 +1436,8 @@ mod tests {
     fn lamp_colour_states_the_verdict() {
         assert_eq!(
             lamps("hotel-wifi", true),
-            // wg0 is red: hotel-wifi promises a tunnel and this fixture has none.
-            vec![Some(Color::Green), Some(Color::Green), Some(Color::Green), Some(Color::Red)]
+            // Both tunnels are red: hotel-wifi promises two and this fixture has none.
+            vec![Some(Color::Green), Some(Color::Green), Some(Color::Green), Some(Color::Red), Some(Color::Red)]
         );
         // wlan0 has no job under hotel-eth: grey, not the red of a fault.
         assert_eq!(lamps("hotel-eth", true)[0], Some(Color::DarkGray));

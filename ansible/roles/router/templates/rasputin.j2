@@ -90,6 +90,9 @@ apply_firewall() {
   # If wg0 disappears, no forward rule matches and policy drop takes over -
   # clients lose connectivity rather than silently egressing in the clear.
   if [[ $vpn == 1 ]]; then egress="$VPN_IF"; else egress="$uplink"; fi
+  # Two tunnels are one exit as far as the kill switch is concerned.
+  local egress_match="\"$egress\""
+  [[ $vpn == 1 && -n $VPN_SPLIT_IF ]] && egress_match="{ \"$VPN_IF\", \"$VPN_SPLIT_IF\" }"
   if [[ $mode == serve ]]; then lan_list="\"$ETH\", \"$AP\""; else lan_list="\"$AP\""; fi
   admin_list="$lan_list"
 {% if admin_on_uplink | default(false) | bool %}
@@ -158,7 +161,7 @@ apply_firewall() {
   # web-only one. The venue-subnet drop above still stands, so the other guests
   # stay unreachable for the whole time the login page is open - the hole is in
   # what protocols may leave, never in who may be reached.
-  local egress_rule="    iifname @lan_ifaces oifname \"$egress\" accept"
+  local egress_rule="    iifname @lan_ifaces oifname $egress_match accept"
   if [[ $portal == 1 ]]; then
     egress_rule="    # CAPTIVE PORTAL MODE: web only, and only long enough to log in.
     iifname @lan_ifaces oifname \"$uplink\" tcp dport { 80, 443 } accept"
@@ -184,7 +187,7 @@ apply_firewall() {
       output_policy="drop"
       output_rules="    oif lo accept
     ct state established,related accept
-    oifname \"$VPN_IF\" accept
+    oifname $egress_match accept
     oifname @lan_ifaces accept
     # The handshake that keeps the tunnel alive must survive the chain that
     # insists on the tunnel, or a single dropped keepalive is unrecoverable.
@@ -192,6 +195,17 @@ apply_firewall() {
     # dhcpcd lease renewal on the venue's uplink.
     oifname \"$uplink\" udp sport 68 udp dport 67 accept
     icmp type { destination-unreachable, time-exceeded } accept"
+      if [[ -n $VPN_SPLIT_IF ]]; then
+        local sep sip sport
+        sep=$(wg show "$VPN_SPLIT_IF" endpoints 2>/dev/null | awk '{print $2}' | head -1)
+        sip=${sep%:*}; sport=${sep##*:}
+        if [[ $sip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ && $sport =~ ^[0-9]+$ ]]; then
+          output_rules="$output_rules
+    oifname \"$uplink\" ip daddr $sip udp dport $sport accept"
+        else
+          echo "rasputin: WARNING - no usable $VPN_SPLIT_IF endpoint ($sep); the split tunnel cannot handshake through the guard" >&2
+        fi
+      fi
     else
       # Fail open, loudly, rather than strand the box: we are already past
       # vpn_start, so dropping the handshake would kill the tunnel that the
@@ -271,7 +285,7 @@ $egress_rule
 
   chain postrouting {
     type nat hook postrouting priority srcnat;
-    oifname "$egress" masquerade
+    oifname $egress_match masquerade
   }
 
   # Router-originated traffic. Wide open unless the profile demands a tunnel,
@@ -299,6 +313,25 @@ NFT
     return 1
   fi
   nft -f "$STATE_DIR/ruleset.nft"
+  apply_steering
+}
+
+# The steering set lives in its own table so that a converge - which deletes
+# and rebuilds table inet rasputin - cannot empty it. blocky caches answers for
+# up to {{ blocky_cache_max }}; an emptied set would send every cached name out
+# the default tunnel until the cache turned over, and nothing would say so. The
+# table is created once, the rule is replaced rather than appended, and the
+# members keep their own expiry. Present in every profile: without a rule
+# sending the mark anywhere it decides nothing.
+apply_steering() {
+  nft list table inet rasputin_steer >/dev/null 2>&1 || nft -f /dev/stdin <<NFT
+table inet rasputin_steer {
+  set split_hosts { type ipv4_addr; flags timeout; timeout {{ split_host_ttl }}; }
+  chain prerouting { type filter hook prerouting priority mangle; policy accept; }
+}
+NFT
+  nft flush chain inet rasputin_steer prerouting
+  nft add rule inet rasputin_steer prerouting ip daddr @split_hosts meta mark set $SPLIT_MARK
 }
 
 # --- the guard that today's outage earned ----------------------------------
@@ -891,6 +924,13 @@ write_avahi_deny() {
 }
 
 VPN_IF={{ vpn_interface }}
+# Set per profile by profile_lookup. A profile may carry a second tunnel that
+# takes only the split domains; see split_start for the whole mechanism.
+VPN_SPLIT_IF=""
+SPLIT_TABLE={{ split_table }}
+SPLIT_MARK={{ split_mark }}
+SPLIT_DNS={{ split_dns_upstream }}
+SPLIT_STATE=/run/rasputin/split-iface
 BLOCKY_LISTEN=/etc/blocky/config.d/20-listen.yml
 BLOCKY_UPSTREAM=/etc/blocky/config.d/15-upstream.yml
 
@@ -908,7 +948,7 @@ profile_lookup() {
   PROFILE_NAME="$1"
   case "$1" in
 {% for name, p in rasputin_profiles.items() %}
-    {{ name }}) MODE={{ 'uplink' if p.uplink == eth_if else 'serve' }}; VPN={{ 1 if p.vpn else 0 }}; MACRAND={{ 1 if p.randomize_mac | default(true) else 0 }} ;;
+    {{ name }}) MODE={{ 'uplink' if p.uplink == eth_if else 'serve' }}; VPN={{ 1 if p.vpn else 0 }}; VPN_IF={{ p.vpn.default if p.vpn is mapping else vpn_interface }}; VPN_SPLIT_IF="{{ p.vpn.domains if p.vpn is mapping else '' }}"; MACRAND={{ 1 if p.randomize_mac | default(true) else 0 }} ;;
 {% endfor %}
 {% for alias, target in legacy_profile_aliases.items() %}
     {{ alias }}) profile_lookup {{ target }} ;;
@@ -924,19 +964,88 @@ resolve_profile() {
 }
 
 vpn_start() {
-  ip link show "$VPN_IF" >/dev/null 2>&1 && return 0
-  local out
-  # Keep wg-quick's output: it names the actual failure (bad key, unresolvable
-  # endpoint, missing conf) and there is nowhere else it gets logged.
-  out=$(wg-quick up "$VPN_IF" 2>&1) \
-    || die "VPN required by this profile but failed to start; refusing to continue unprotected\n$out"
-  echo "rasputin: $VPN_IF up"
+  local uplink="$1" out
+  if ! ip link show "$VPN_IF" >/dev/null 2>&1; then
+    # Keep wg-quick's output: it names the actual failure (bad key, unresolvable
+    # endpoint, missing conf) and there is nowhere else it gets logged.
+    out=$(wg-quick up "$VPN_IF" 2>&1) \
+      || die "VPN required by this profile but failed to start; refusing to continue unprotected\n$out"
+    echo "rasputin: $VPN_IF up"
+  fi
+  [[ -n $VPN_SPLIT_IF ]] && split_start "$uplink"
+  return 0
+}
+
+# The second tunnel. Everything leaves through $VPN_IF except the names in
+# split_domains, which leave through this one - a fast exit near the venue for
+# the bulk of the traffic, a far exit for the services that refuse the near
+# one. The kill switch is untouched by the split: nothing is ever routed in
+# the clear, only the choice of tunnel changes.
+#
+# The classifier is DNS, the way UniFi does it. blocky forwards the split
+# domains to dnsmasq on loopback, dnsmasq answers them from the resolver inside
+# this tunnel and records every address it returns in the nftables set
+# rasputin_steer/split_hosts, and a mangle rule marks packets to any address in
+# that set. This rule sends marked packets to a table whose only route is this
+# interface. A client that brings its own DoH is not classified and exits with
+# everything else.
+#
+# Brought up by hand rather than wg-quick, because wg-quick's job is to own the
+# default route and this tunnel must not: its route lives in $SPLIT_TABLE and
+# nowhere else. The endpoint is pinned to the uplink so the tunnel does not
+# ride inside the default one, and the split resolver is routed through it.
+split_start() {
+  local uplink="$1" ifc="$VPN_SPLIT_IF" conf="/etc/wireguard/$VPN_SPLIT_IF.conf" addr ep upgw
+  [[ -f $conf ]] || die "this profile routes the split domains through $ifc, but $conf does not exist"
+  if ! ip link show "$ifc" >/dev/null 2>&1; then
+    ip link add "$ifc" type wireguard
+    if ! wg setconf "$ifc" <(wg-quick strip "$ifc"); then
+      ip link del "$ifc" 2>/dev/null || true
+      die "$conf did not load into $ifc"
+    fi
+    for addr in $(sed -n 's/^Address *= *//p' "$conf" | tr ',' ' '); do
+      [[ $addr == *.* ]] && ip addr add "$addr" dev "$ifc"
+    done
+    ip link set dev "$ifc" mtu 1420 up
+    echo "rasputin: $ifc up - carries only: {{ split_domains | join(' ') }}"
+  fi
+  mkdir -p "$(dirname "$SPLIT_STATE")"; echo "$ifc" > "$SPLIT_STATE"
+  ip route replace default dev "$ifc" table "$SPLIT_TABLE"
+  ip rule del pref 100 2>/dev/null || true
+  ip rule add fwmark "$SPLIT_MARK" lookup "$SPLIT_TABLE" pref 100
+  ep=$(wg show "$ifc" endpoints 2>/dev/null | awk '{print $2}' | head -1); ep=${ep%:*}
+  upgw=$(ip -4 route show default dev "$uplink" 2>/dev/null \
+         | awk '{for(i=1;i<=NF;i++) if($i=="via") {print $(i+1); exit}}')
+  if [[ $ep =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ && -n $upgw ]]; then
+    ip route replace "$ep/32" via "$upgw" dev "$uplink"
+  else
+    echo "rasputin: WARNING - could not pin $ifc's endpoint to $uplink; it may ride inside $VPN_IF" >&2
+  fi
+  ip route replace "$SPLIT_DNS/32" dev "$ifc"
+  # Replies arrive on this interface for flows the main table would send
+  # elsewhere; strict reverse-path filtering would drop every one of them.
+  sysctl -qw "net.ipv4.conf.$ifc.rp_filter=2" 2>/dev/null || true
 }
 
 vpn_stop() {
-  ip link show "$VPN_IF" >/dev/null 2>&1 || return 0
-  wg-quick down "$VPN_IF" >/dev/null 2>&1 || true
-  echo "rasputin: $VPN_IF down"
+  local ifc ep
+  # The split tunnel first: it is not wg-quick's, and it leaves a rule, a table
+  # and an endpoint route behind that wg-quick knows nothing about.
+  if [[ -f $SPLIT_STATE ]]; then
+    ifc=$(cat "$SPLIT_STATE")
+    ep=$(wg show "$ifc" endpoints 2>/dev/null | awk '{print $2}' | head -1); ep=${ep%:*}
+    ip rule del pref 100 2>/dev/null || true
+    ip route flush table "$SPLIT_TABLE" 2>/dev/null || true
+    if [[ $ep =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then ip route del "$ep/32" 2>/dev/null || true; fi
+    if ip link del "$ifc" 2>/dev/null; then echo "rasputin: $ifc down"; fi
+    rm -f "$SPLIT_STATE"
+  fi
+  # Then whatever wg-quick brought up. Every interface, not just $VPN_IF: the
+  # profile may have changed since, and the old tunnel must not survive it.
+  for ifc in $(wg show interfaces 2>/dev/null); do
+    wg-quick down "$ifc" >/dev/null 2>&1 || ip link del "$ifc" 2>/dev/null || true
+    echo "rasputin: $ifc down"
+  done
 }
 
 # --- captive portals --------------------------------------------------------
@@ -1040,7 +1149,7 @@ venue_resolvers() {
 # `upstreams` block every time, so there is never a question about how two
 # config.d fragments merge. Keep in step with blocky-15-upstream.yml.j2.
 write_blocky_upstream() {
-  local portal="${1:-0}" resolvers="${2:-}" r
+  local portal="${1:-0}" resolvers="${2:-}" split="${3:-0}" r
   mkdir -p "$(dirname "$BLOCKY_UPSTREAM")"
   {
     if [[ $portal == 1 ]]; then
@@ -1070,6 +1179,17 @@ write_blocky_upstream() {
     fi
     echo "  strategy: {{ blocky_upstream_strategy }}"
     echo "  timeout: {{ blocky_upstream_timeout }}"
+    if [[ $split == 1 ]]; then
+      echo "# The split domains resolve through dnsmasq on 127.0.0.1:{{ split_dns_port }}, which"
+      echo "# answers from inside the split tunnel and records every address in the"
+      echo "# nftables set that steers their traffic. Blocking still applies first."
+      echo "conditional:"
+      echo "  fallbackUpstream: false"
+      echo "  mapping:"
+{% for d in split_domains %}
+      echo "    {{ d }}: 127.0.0.1:{{ split_dns_port }}"
+{% endfor %}
+    fi
   } > "$BLOCKY_UPSTREAM"
 }
 
@@ -1142,9 +1262,9 @@ portal_open() {
 # tunnel actually reaches its peer, and a captive portal is the usual reason
 # it does not.
 wg_handshake_ok() {
-  local secs="${1:-20}" i hs
+  local ifc="$1" secs="${2:-20}" i hs
   for i in $(seq 1 "$secs"); do
-    hs=$(wg show "$VPN_IF" latest-handshakes 2>/dev/null | awk '{print $2; exit}')
+    hs=$(wg show "$ifc" latest-handshakes 2>/dev/null | awk '{print $2; exit}')
     [[ -n $hs && $hs != 0 ]] && return 0
     sleep 1
   done
@@ -1291,12 +1411,16 @@ converge() {
          die "a CAPTIVE PORTAL is in the way, so $VPN_IF will never handshake.\n  login page: $PORTAL_URL\n  clear it first:  rasputin portal\n  then:            rasputin $profile" ;;
       2) echo "rasputin: WARNING - no HTTP path out $uplink at all - converging fail-closed" >&2 ;;
     esac
-    vpn_start
+    vpn_start "$uplink"
     # wg-quick "up" only creates the interface; it succeeds against a network
     # that drops every packet it sends. A handshake is the only proof the peer
     # is reachable, and the probe above has already ruled out a portal.
-    wg_handshake_ok 20 \
+    wg_handshake_ok "$VPN_IF" 20 \
       || echo "rasputin: WARNING - no $VPN_IF handshake, but the network probed clear - peer or key problem, not a portal" >&2
+    if [[ -n $VPN_SPLIT_IF ]]; then
+      wg_handshake_ok "$VPN_SPLIT_IF" 20 \
+        || echo "rasputin: WARNING - no $VPN_SPLIT_IF handshake; the split domains have no exit until it does" >&2
+    fi
   fi
 
   # Upstreams last: venue_resolvers reads the DHCP lease, and the lease is only
@@ -1307,7 +1431,7 @@ converge() {
     write_blocky_upstream 1 "$_vres"
     echo "rasputin: DNS is PLAINTEXT to ${_vres:-<none>} while the portal is open"
   else
-    write_blocky_upstream 0
+    write_blocky_upstream 0 "" "$([[ $VPN == 1 && -n $VPN_SPLIT_IF ]] && echo 1 || echo 0)"
   fi
 
   # The listen addresses just changed with the mode and blocky binds them at
@@ -1343,7 +1467,7 @@ converge() {
   fi
   sleep 2
   assert_sane "$mode"
-  echo "rasputin: converged to '$profile' (mode=$mode uplink=$uplink egress=$([[ $VPN == 1 ]] && echo "$VPN_IF" || echo "$uplink")$([[ $portal == 1 ]] && echo " PORTAL"))"
+  echo "rasputin: converged to '$profile' (mode=$mode uplink=$uplink egress=$([[ $VPN == 1 ]] && echo "$VPN_IF${VPN_SPLIT_IF:+ + $VPN_SPLIT_IF for the split domains}" || echo "$uplink")$([[ $portal == 1 ]] && echo " PORTAL"))"
 }
 
 # The uplink's address is not a constant. A phone hotspot re-issues on a fresh
@@ -1387,7 +1511,7 @@ refresh() {
   # A new lease under a tunnel profile with no handshake is the shape of a
   # captive portal appearing under the box - a venue moved onto, or a login
   # that expired overnight. The kill switch is doing its job; say what to do.
-  if [[ $VPN == 1 ]] && ! wg_handshake_ok 1; then
+  if [[ $VPN == 1 ]] && ! wg_handshake_ok "$VPN_IF" 1; then
     echo "rasputin: WARNING - $VPN_IF has no handshake, so clients have no egress. A captive portal is the usual cause: rasputin portal --check" >&2
   fi
 }
@@ -1440,6 +1564,17 @@ mac_status_line() {
   fi
 }
 
+tunnel_status_line() {
+  local ifc="$1" hs
+  ip link show "$ifc" >/dev/null 2>&1 || { echo down; return 0; }
+  hs=$(wg show "$ifc" latest-handshakes 2>/dev/null | awk '{print $2; exit}')
+  if [[ -n $hs && $hs != 0 ]]; then
+    echo "UP handshake $(( $(date +%s) - hs ))s ago"
+  else
+    echo "UP no handshake"
+  fi
+}
+
 upstream_status_line() {
   [[ -f $BLOCKY_UPSTREAM ]] || { echo "unknown - $BLOCKY_UPSTREAM absent"; return 0; }
   local ups; ups=$(awk '/^      - /{sub(/^      - /,""); printf "%s ", $0}' "$BLOCKY_UPSTREAM")
@@ -1458,8 +1593,14 @@ status() {
   local supl; [[ $smode == serve ]] && supl="$WIFI" || supl="$ETH"
   echo "profile       : $(cat "$STATE" 2>/dev/null || echo '<unset>')"
   echo "portal        : $(portal_status_line)"
-  echo "vpn ($VPN_IF)    : $(ip link show "$VPN_IF" >/dev/null 2>&1 && echo UP || echo down)"
-  echo "egress        : $(nft list chain inet rasputin postrouting 2>/dev/null | grep -oE 'oifname "[a-z0-9]+" masquerade' || echo none)"
+  echo "vpn required  : $([[ $VPN == 1 ]] && echo "$VPN_IF${VPN_SPLIT_IF:+ $VPN_SPLIT_IF}" || echo none)"
+  echo "vpn ($VPN_IF)    : $(tunnel_status_line "$VPN_IF")"
+  if [[ -n $VPN_SPLIT_IF ]]; then
+    echo "vpn ($VPN_SPLIT_IF)    : $(tunnel_status_line "$VPN_SPLIT_IF")"
+    echo "split domains : {{ split_domains | join(' ') }}"
+    echo "split hosts   : $(nft list set inet rasputin_steer split_hosts 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | wc -l) addresses steered"
+  fi
+  echo "egress        : $(nft list chain inet rasputin postrouting 2>/dev/null | grep masquerade | sed 's/^[[:space:]]*//' || echo none)"
   echo "dnsmasq (dhcp): $(systemctl is-active dnsmasq)"
   echo "blocky (dns)  : $(systemctl is-active blocky)"
   echo "dns upstream  : $(upstream_status_line)"
@@ -1468,7 +1609,7 @@ status() {
   echo "hostapd       : $(systemctl is-active hostapd)"
   echo "lan snippet   : $([[ -f $LAN_SNIPPET ]] && echo present || echo absent)"
   echo "default route : $(ip route show default | tr '\n' ';' || echo none)"
-  echo "masquerade    : $(nft -a list chain inet rasputin postrouting 2>/dev/null | grep -o 'oifname "[a-z0-9]*" masquerade' || echo none)"
+  echo "masquerade    : $(nft list chain inet rasputin postrouting 2>/dev/null | grep masquerade | sed 's/^[[:space:]]*//' || echo none)"
   echo "admin ifaces  : $(nft list set inet rasputin admin_ifaces 2>/dev/null | tr -d '\n' | grep -oE 'elements = \{[^}]*\}' | tr -s ' ' || echo '<none - admin plane NOT restricted or table absent>')"
 }
 

@@ -1,12 +1,18 @@
 # Base dnsmasq policy. Managed by Ansible.
 #
-# dnsmasq is a DHCP SERVER ONLY. blocky owns :53 - it does the blocklists and
-# the DoH that dnsmasq cannot. Nothing here may bind a DNS port.
+# dnsmasq is the DHCP server, and a resolver for exactly one purpose: the split
+# domains. blocky owns :53 and forwards those names here; this answers them
+# from the resolver inside the split tunnel and records every address in the
+# nftables set that steers their traffic - see 50-split-dns.conf. Nothing else
+# asks it anything, and it listens for DNS on loopback only.
 #
-# Known loss: DHCP lease names stop resolving, because the resolver that knows
-# the leases is no longer the resolver clients ask. To undo the whole cutover:
-# stop blocky, delete this line, restart dnsmasq.
-port=0
+# Known loss: DHCP lease names do not resolve, because the resolver that knows
+# the leases is not the one clients ask.
+port={{ split_dns_port }}
+listen-address=127.0.0.1
+# No resolv.conf: that names blocky, and blocky forwards here. A loop.
+no-resolv
+no-hosts
 
 log-facility=/var/log/dnsmasq.log
 conf-dir=/etc/dnsmasq.d

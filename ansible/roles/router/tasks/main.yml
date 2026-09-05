@@ -473,6 +473,13 @@
     mode: "0644"
   notify: restart dnsmasq
 
+- name: Split-domain resolver (constant)
+  ansible.builtin.template:
+    src: 50-split-dns.conf.j2
+    dest: /etc/dnsmasq.d/50-split-dns.conf
+    mode: "0644"
+  notify: restart dnsmasq
+
 # Staged, not installed: rasputin installs/removes it per mode.
 - name: Stage the eth0-LAN snippet
   ansible.builtin.template:
@@ -880,9 +887,12 @@
 # this one carries the private key.
 - name: Stop wg-quick hijacking the box's resolver
   ansible.builtin.replace:
-    path: "/etc/wireguard/{{ vpn_interface }}.conf"
+    path: "{{ item.path }}"
     regexp: '^DNS\s*=.*$'
     replace: '# DNS = removed by rasputin: this box resolves via blocky on 127.0.0.1'
+  loop: "{{ _wg_confs.files | selectattr('path', 'search', '\\.conf$') | list }}"
+  loop_control:
+    label: "{{ item.path }}"
   failed_when: false
   no_log: true
 

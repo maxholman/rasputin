@@ -17,12 +17,23 @@ if timeout 2 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' 2>/dev/null; then echo "tcp4
 # Two addresses, because a venue firewall can hijack one and not the other -
 # measured 2026-09-05: 1.1.1.1 answered with the hotel's own certificate while
 # 1.0.0.1 passed clean, and the status tool showed a portal for the whole stay.
+# Four seconds, because through a tunnel on lossy hotel wifi a TLS fetch took
+# 0.7-2.0s (measured) and a 2s cap made the answer flap on every other tick.
+# The last good answer is kept for five minutes so one slow tick stays quiet;
+# a real loss of path still shows, because the cache expires and the tcp443
+# probe above has its own red line.
 if command -v curl >/dev/null; then
-  extip=$(curl -s --max-time 2 https://1.1.1.1/cdn-cgi/trace | awk -F= '/^ip=/{print $2}')
+  cache=/run/rasputin/extip
+  extip=$(curl -s --max-time 4 https://1.1.1.1/cdn-cgi/trace | awk -F= '/^ip=/{print $2}')
   [ -n "$extip" ] || extip=$(curl -s --max-time 2 https://1.0.0.1/cdn-cgi/trace | awk -F= '/^ip=/{print $2}')
+  if [ -n "$extip" ]; then
+    mkdir -p /run/rasputin && printf '%s' "$extip" > "$cache"
+  elif [ -f "$cache" ] && [ $(( $(date +%s) - $(stat -c %Y "$cache") )) -lt 300 ]; then
+    extip="$(cat "$cache") (cached)"
+  fi
   echo "extip $extip"
 else echo "extip nocurl"; fi
-s wg;       wg show wg0 2>/dev/null
+s wg;       wg show 2>/dev/null
 s addrs;    ip -br addr show 2>/dev/null
 s netdev;   cat /proc/net/dev
 s doh;      ss -lntp 'sport = :443' 2>/dev/null | grep -c blocky

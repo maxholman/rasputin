@@ -1,0 +1,10 @@
+# The split resolver. Managed by Ansible - edit the role, not this file.
+#
+# Queries arrive only from blocky, which forwards split_domains here. The
+# upstream is Proton's resolver, which exists only inside the split tunnel;
+# rasputin routes it there when the tunnel is up, and with the tunnel down
+# these names simply fail rather than leak. Every answer lands in the set that
+# rasputin's mangle rule marks on, which is what routes the traffic that
+# follows the lookup out the same tunnel the lookup went through.
+server={{ split_dns_upstream }}
+nftset=/{{ split_domains | join('/') }}/4#inet#rasputin_steer#split_hosts

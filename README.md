@@ -24,13 +24,25 @@ from the first — a DHCP client when it *is* the uplink, a LAN leg (10.6.141.1,
 DHCP server) otherwise — and an unplugged LAN leg has nobody to serve, so it
 stays out of the way.
 
-| profile | uplink | tunnel + kill switch | `eth0` |
+| profile | uplink | tunnels + kill switch | `eth0` |
 |---|---|---|---|
-| `home` | `wlan0` → own hotspot | no | serves the wired net |
-| `hotel-wifi` | `wlan0` → venue wifi | **yes** | serves the wired net |
-| `hotel-wifi-novpn` | `wlan0` → venue wifi | no | serves the wired net |
-| `hotel-eth` | `eth0` → venue ethernet | **yes** | is the uplink |
-| `hotel-eth-novpn` | `eth0` → venue ethernet | no | is the uplink |
+| `home` | `wlan0` → own hotspot | none | serves the wired net |
+| `hotel-wifi` | `wlan0` → venue wifi | **two**: `wg1` for everything, `wg0` for the split domains | serves the wired net |
+| `hotel-wifi-novpn` | `wlan0` → venue wifi | none | serves the wired net |
+| `hotel-eth` | `eth0` → venue ethernet | **two**, as above | is the uplink |
+| `hotel-eth-novpn` | `eth0` → venue ethernet | none | is the uplink |
+
+Two tunnels because one exit is rarely right for everything: a near exit is
+fast for the bulk of the traffic, and a far one is for the services that
+refuse the near one (from Hong Kong, that is Claude and OpenAI). The split is
+by domain, the way UniFi does it: blocky forwards `split_domains` to dnsmasq,
+dnsmasq answers them from the resolver *inside* the far tunnel and records every
+address in an nftables set, and a mangle rule marks packets to those addresses
+into a routing table whose only route is that tunnel. Nothing is ever routed in
+the clear, so the kill switch is exactly as tight as with one tunnel. A client
+running its own DoH is not classified and exits with everything else. Each
+tunnel is a Proton WireGuard config in `/etc/wireguard/<name>.conf`; the role
+never carries those keys, so they are copied onto the box by hand.
 
 There is no mode word to type. `serve` and `uplink` used to say which way
 `eth0` faced and nothing about the tunnel, which is how the box spent a night

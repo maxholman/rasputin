@@ -126,9 +126,9 @@ ap_device_timeout: 20
 # that said nothing of the kind.
 rasputin_profiles:
   home:             { uplink: wlan0, vpn: false, randomize_mac: false } # own 5G hotspot, no tunnel
-  hotel-wifi:       { uplink: wlan0, vpn: true }   # venue wifi, tunnel + kill switch
+  hotel-wifi:       { uplink: wlan0, vpn: true }   # venue wifi, single tunnel (wg0) + kill switch
   hotel-wifi-novpn: { uplink: wlan0, vpn: false }  # venue wifi in the clear: portal cleared, no tunnel wanted
-  hotel-eth:        { uplink: eth0,  vpn: true }   # venue ethernet, tunnel + kill switch
+  hotel-eth:        { uplink: eth0,  vpn: true }   # venue ethernet, single tunnel (wg0) + kill switch
   hotel-eth-novpn:  { uplink: eth0,  vpn: false }  # venue ethernet in the clear
 
 # The mode words from before profiles, and what each meant. rasputin reads them
@@ -140,7 +140,26 @@ legacy_profile_aliases:
   uplink: hotel-eth-novpn
   wan: hotel-eth-novpn
 
+# `vpn: true` means one tunnel on this interface carrying everything.
 vpn_interface: wg0
+
+# `vpn: { default: X, domains: Y }` means two: X carries everything, Y carries
+# only split_domains. The near exit is fast for the bulk of the traffic; the
+# far exit is for the services that refuse the near one - from Hong Kong, that
+# is these. Both are tunnels, so the kill switch is exactly as tight as with
+# one. The classifier is DNS: blocky forwards these names to dnsmasq, which
+# answers them from split_dns_upstream (Proton's resolver, reachable only
+# inside tunnel Y) and writes every address into the nftables set the mangle
+# rule marks on. A client running its own DoH bypasses the classifier and
+# exits with everything else.
+split_domains: [claude.ai, anthropic.com, claude.com, openai.com, chatgpt.com, oaistatic.com, oaiusercontent.com]
+split_dns_upstream: 10.2.0.1
+split_dns_port: 5353
+split_table: 51900
+split_mark: "0x51"
+# Set members outlive blocky's cache (blocky_cache_max), or a cached answer
+# could be routed out the wrong tunnel after its steering entry had expired.
+split_host_ttl: 24h
 
 # How long to wait for wlan0 to take an address after a MAC change. 20s was
 # not always enough mid-session, and 45s was not enough at cold boot (scan +
