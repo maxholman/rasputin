@@ -46,7 +46,7 @@ fn usage() -> ! {
         "usage: rasputin-status [--host ADDR] [--user NAME] [-i KEY] [--interval SECS]\n\
                         [--sudo-pass-file PATH] [--once]\n\
          \n\
-         With no --host, tries 10.6.141.1 (eth0 leg) then 10.9.141.1 (AP leg).\n\
+         With no --host, probes 10.6.141.1 (eth0 leg) and 10.9.141.1 (AP leg) at once.\n\
          With no -i, uses your ssh defaults - ssh_config and the agent.\n\
          --once prints one plain-text snapshot and exits (for scripts)."
     );
@@ -85,14 +85,26 @@ fn pick_host(opts: &Opts) -> Option<String> {
         Some(h) => vec![h.clone()],
         None => vec!["10.6.141.1".into(), "10.9.141.1".into()],
     };
-    candidates.into_iter().find(|h| {
-        format!("{h}:22")
-            .to_socket_addrs()
-            .ok()
-            .and_then(|mut a| a.next())
-            .and_then(|a| TcpStream::connect_timeout(&a, Duration::from_millis(1200)).ok())
-            .is_some()
-    })
+    // Both legs at once, first to answer wins. With eth0 unplugged the first
+    // candidate is a dead address, and probing it before the second cost a
+    // full connect timeout on every start. Either leg reaches the same box,
+    // so there is nothing to prefer between them.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let n = candidates.len();
+    for h in candidates {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let ok = format!("{h}:22")
+                .to_socket_addrs()
+                .ok()
+                .and_then(|mut a| a.next())
+                .and_then(|a| TcpStream::connect_timeout(&a, Duration::from_millis(1200)).ok())
+                .is_some();
+            let _ = tx.send((h, ok));
+        });
+    }
+    drop(tx);
+    rx.iter().take(n).find(|(_, ok)| *ok).map(|(h, _)| h)
 }
 
 fn ssh_base(opts: &Opts, host: &str) -> Command {

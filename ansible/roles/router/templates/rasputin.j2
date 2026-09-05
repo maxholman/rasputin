@@ -35,6 +35,12 @@ END='# <<< rasputin managed <<<'
 
 die() { printf 'rasputin: %b\n' "$*" >&2; exit 1; }
 
+usage() { printf '%b\n' "usage: rasputin {{'{'}}{{ rasputin_profiles.keys()|join('|') }}|converge|refresh|confirm|status|portal|mac-new|join|forget{{'}'}}\n              [--rollback SECS] [--for SECS] [--check] [--scan]\n  profile = which leg faces the venue + whether a tunnel is required;\n            {{ eth_if }} serves the wired net unless it IS the uplink\n  refresh = re-apply the firewall for the uplink's current address\n  portal  = open a bounded hole to clear a captive portal (--check only probes)\n  mac-new = drop the pinned uplink MAC and take a fresh identity\n  join    = join a venue wifi: join <ssid> [passphrase], or --scan to list\n  forget  = drop a network that join wrote: forget <ssid>"; }
+
+# Asking for a password in order to print the usage is the wrong first
+# impression, and the one every new operator gets. Answered before sudo.
+case "${1:-}" in ''|-h|--help|help) usage; [[ -n ${1:-} ]] && exit 0 || exit 1 ;; esac
+
 # Re-enter through sudo rather than refusing, so `rasputin join` works the way
 # it is written down. Always by absolute path, which is what the sudoers rule
 # pins - being reached through the /usr/local/bin symlink must not change which
@@ -488,6 +494,35 @@ ap_mac_new() {
 {% endif %}
 }
 
+# The permanent address is the one identity that follows this box to every
+# venue, and it is on the air the moment a frame is sent - a scan, an
+# association, a portal login - not when a profile is declared. Anything about
+# to transmit somewhere new checks for it first. iproute2 prints `permaddr`
+# only while the interface wears something else, so its absence is the test.
+wears_permanent_mac() {
+  ! ip -o link show dev "$WIFI" 2>/dev/null | grep -q ' permaddr '
+}
+
+# Randomise before the first frame. Costs a supplicant restart, because its
+# randomisation keys are read at startup only - and the supplicant must be
+# stopped across the change or it re-randomises over the new address itself.
+shed_permanent_mac() {
+{% if randomize_client_mac | default(true) | bool %}
+  wears_permanent_mac || return 0
+  echo "rasputin: $WIFI is wearing its permanent address - taking a random one before this network sees it"
+  supplicant stop
+  set_wpa_randomisation 1
+  randomize_mac "$WIFI"
+  supplicant start
+  local i
+  for i in $(seq 1 10); do
+    wpa_cli -i "$WIFI" status >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+{% endif %}
+  return 0
+}
+
 pin_uplink_mac() {
   local ifc="$1" mac ssid="-"
   mac=$(cat "/sys/class/net/$ifc/address" 2>/dev/null) || return 0
@@ -634,6 +669,11 @@ join_network() {
   n=$(printf '%s' "$ssid" | wc -c)
   (( n <= 32 )) || die "SSIDs are limited to 32 bytes - that one is $n"
 
+  # Before anything else touches the air. A box powered on at the venue still
+  # declaring `home` has been probing with its real address since boot; this
+  # is the first command that can stop it.
+  shed_permanent_mac
+
   kind=open
   if [[ -n $pass ]]; then
     kind=WPA2
@@ -694,22 +734,7 @@ join_network() {
     echo "rasputin: dropped the pinned MAC - a new network gets a new identity"
   fi
   echo "rasputin: wrote network block for \"$ssid\" ($kind, priority $priority)"
-  local restart=0
-{% if randomize_client_mac | default(true) | bool %}
-  # Joining somewhere is the venue's first sight of this box, and the declared
-  # profile may still be one that keeps the permanent address - `home`, on a
-  # box powered on at the hotel. By the time a venue profile is declared the
-  # real MAC has been on the air for as long as it took to type it, so join
-  # turns the supplicant's randomisation on whatever the profile says. That
-  # setting is read at startup only, which is why this path restarts the
-  # supplicant where a plain join merely reconfigures it.
-  local MODE VPN MACRAND PROFILE_NAME
-  if profile_lookup "$(cat "$STATE" 2>/dev/null)" && [[ $MACRAND == 0 ]] && ! wpa_randomisation_is 1; then
-    set_wpa_randomisation 1; restart=1
-    echo "rasputin: '$PROFILE_NAME' keeps the permanent MAC, but this is a new network - $WIFI takes a random one"
-  fi
-{% endif %}
-  wpa_apply "$ssid" "$restart"
+  wpa_apply "$ssid"
 }
 
 # `wpa_cli reconfigure` re-reads the file in place. It is not seamless - the
@@ -717,7 +742,7 @@ join_network() {
 # either way - but a full restart additionally hands a pinned MAC back to the
 # supplicant's own randomisation before the pin can be re-asserted.
 wpa_apply() {
-  local want="$1" restart="${2:-0}" i state ssid addr reply
+  local want="$1" i state ssid addr reply
   # wpa_cli exits 0 even when the daemon answers FAIL, so its status says
   # nothing: the answer has to be read. FAIL means the file did not parse, and
   # one bad block rejects the WHOLE config - the running daemon keeps its old
@@ -730,8 +755,6 @@ wpa_apply() {
       die "the supplicant refused to parse its config with \"$want\" in it.\n  the block has been removed again, so the uplink still comes up at boot.\n  report this: the SSID passed every check and should have been representable." ;;
     *) die "the block is written, but wpa_cli could not reach the supplicant on $WIFI.\n  it will be picked up by: systemctl restart wpa_supplicant@$WIFI" ;;
   esac
-  # After the reconfigure, so the file has already passed the daemon's parser.
-  [[ $restart == 1 ]] && supplicant restart
 
   for i in $(seq 1 {{ wifi_reassociate_timeout | default(45) }}); do
     # A rejected network does not fail, it retries - the supplicant parks it as
@@ -808,6 +831,9 @@ wait_for_v4() {
 # loudly - the supplicant simply never associates and offers no reason. Taking
 # the name off the air removes the guess.
 wpa_scan() {
+  # A scan is the first thing a venue hears from this box, and probe requests
+  # carry the source address - so the identity is settled before the scan.
+  shed_permanent_mac
   wpa_cli -i "$WIFI" scan >/dev/null 2>&1 || die "could not reach the supplicant on $WIFI"
   sleep 3
   # SSIDs are free to contain spaces, so the name goes last and everything
@@ -1083,8 +1109,11 @@ portal_open() {
   [ "$secs" -ge 60 ] || die "--for must be at least 60s, got: $secs"
 
   # A new venue is a new identity, and the pin is what SURVIVES a venue - so it
-  # goes before the MAC that this portal will authorise is chosen.
+  # goes before the MAC that this portal will authorise is chosen. And the one
+  # address that must never be pinned is the permanent one: a portal login
+  # then ties the venue to the hardware for the whole stay.
   rm -f "$MAC_PIN"
+  shed_permanent_mac
   { echo "profile=$profile"
     echo "opened=$(date -Is)"
     echo "expires=$(( $(date +%s) + secs ))"
@@ -1488,5 +1517,5 @@ case "$cmd" in
   confirm)  cancel_rollback ;;
   rollback-fire) rollback_fire ;;
   status)   status ;;
-  *) die "usage: rasputin {{'{'}}{{ rasputin_profiles.keys()|join('|') }}|converge|refresh|confirm|status|portal|mac-new|join|forget{{'}'}}\n              [--rollback SECS] [--for SECS] [--check] [--scan]\n  profile = which leg faces the venue + whether a tunnel is required;\n            {{ eth_if }} serves the wired net unless it IS the uplink\n  refresh = re-apply the firewall for the uplink's current address\n  portal  = open a bounded hole to clear a captive portal (--check only probes)\n  mac-new = drop the pinned uplink MAC and take a fresh identity\n  join    = join a venue wifi: join <ssid> [passphrase], or --scan to list\n  forget  = drop a network that join wrote: forget <ssid>" ;;
+  *) usage >&2; exit 1 ;;
 esac
