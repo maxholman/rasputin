@@ -516,7 +516,44 @@ fn fmt_bytes(n: u64) -> String {
     format!("{n}")
 }
 
-/// `SSID: venuewifi` + `signal: -58 dBm` → `venuewifi · -58 dBm`
+/// The `freq:` line of `iw dev wlan0 link`, in MHz, as a band label. 5 GHz
+/// carries far less through hotel walls than 2.4 GHz, so which band the client
+/// landed on is often the whole story behind a weak uplink - and the built-in
+/// Broadcom firmware picks the band itself, sometimes badly.
+fn wifi_band(link: &str) -> Option<&'static str> {
+    let mhz: f64 = link
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("freq:"))?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(if mhz >= 5000.0 { "5GHz" } else { "2.4GHz" })
+}
+
+/// The signal in dBm as a number, for colouring. Closer to zero is stronger.
+fn wifi_signal_dbm(link: &str) -> Option<i32> {
+    link.lines()
+        .find_map(|l| l.trim().strip_prefix("signal:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// A signal's health: strong is green, usable is amber, weak is red. The
+/// thresholds are where a WireGuard tunnel starts losing handshakes on this
+/// hardware - above about -60 it holds, below about -72 it does not.
+fn signal_health(dbm: i32) -> Color {
+    if dbm >= -60 {
+        Color::Green
+    } else if dbm >= -72 {
+        Color::Yellow
+    } else {
+        Color::Red
+    }
+}
+
+/// `SSID: venuewifi` + `freq: 2437` + `signal: -58 dBm` → `venuewifi · 2.4GHz · -58 dBm`
 fn wifi_detail(link: &str) -> String {
     let (mut ssid, mut signal) = (String::new(), String::new());
     for line in link.lines() {
@@ -528,9 +565,10 @@ fn wifi_detail(link: &str) -> String {
             signal = v.trim().to_string();
         }
     }
+    let band = wifi_band(link).map(|b| format!(" · {b}")).unwrap_or_default();
     match (ssid.is_empty(), signal.is_empty()) {
-        (false, false) => format!("{ssid} · {signal}"),
-        (false, true) => ssid,
+        (false, false) => format!("{ssid}{band} · {signal}"),
+        (false, true) => format!("{ssid}{band}"),
         (true, false) => signal,
         (true, true) => "not associated".into(),
     }
@@ -922,12 +960,23 @@ fn build_lines(
         };
         // Background on blank cells, not a block glyph: a solid rectangle in
         // every font, including those with no U+2588.
-        let lamp = match p.state {
-            PortState::Up => Some(Color::Green),
-            PortState::NoAddr => Some(Color::Yellow),
-            PortState::Down => Some(Color::Red),
-            PortState::Unused => Some(Color::DarkGray),
-            PortState::Unknown => None,
+        // The uplink's lamp is its signal, not merely "has an address": a wifi
+        // client can hold a lease at -75 dBm and still be too weak to carry a
+        // tunnel. So when this is the associated wifi uplink, the lamp is green
+        // / amber / red by strength - which is the fact that actually predicts
+        // whether the link works. Every other row keeps the plain state lamp.
+        let lamp = match (p.role == "uplink" && p.iface == "wlan0" && p.state == PortState::Up)
+            .then(|| wifi_signal_dbm(&st.wlan0_link))
+            .flatten()
+        {
+            Some(dbm) => Some(signal_health(dbm)),
+            None => match p.state {
+                PortState::Up => Some(Color::Green),
+                PortState::NoAddr => Some(Color::Yellow),
+                PortState::Down => Some(Color::Red),
+                PortState::Unused => Some(Color::DarkGray),
+                PortState::Unknown => None,
+            },
         };
         let lamp_span = match (colour, lamp) {
             (true, Some(c)) => Span::styled("  ", Style::default().bg(c)),
@@ -1363,6 +1412,13 @@ mod tests {
     #[test]
     fn wifi_detail_survives_missing_halves() {
         assert_eq!(wifi_detail("\tSSID: foo\n\tsignal: -58 dBm"), "foo · -58 dBm");
+        assert_eq!(wifi_detail("\tSSID: foo\n\tfreq: 2437\n\tsignal: -58 dBm"), "foo · 2.4GHz · -58 dBm");
+        assert_eq!(wifi_detail("\tSSID: foo\n\tfreq: 5300\n\tsignal: -74 dBm"), "foo · 5GHz · -74 dBm");
+        assert_eq!(wifi_band("\tfreq: 5300.0"), Some("5GHz"));
+        assert_eq!(wifi_signal_dbm("\tsignal: -74 dBm"), Some(-74));
+        assert_eq!(signal_health(-52), Color::Green);
+        assert_eq!(signal_health(-66), Color::Yellow);
+        assert_eq!(signal_health(-75), Color::Red);
         assert_eq!(wifi_detail("\tSSID: foo"), "foo");
         assert_eq!(wifi_detail(""), "not associated");
     }
