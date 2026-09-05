@@ -554,9 +554,53 @@ fn wg_field(block: &str, key: &str) -> Option<String> {
     block.lines().find_map(|l| l.trim().strip_prefix(key).map(|v| v.trim().to_string()))
 }
 
-/// "latest handshake: 1 minute, 2 seconds ago" → "1 minute, 2 seconds ago"
-fn wg_handshake(st: &Status, iface: &str) -> Option<String> {
-    wg_blocks(st).into_iter().find(|(n, _)| n == iface).and_then(|(_, b)| wg_field(&b, "latest handshake:"))
+/// WireGuard's relative time ("1 minute, 2 seconds ago", "3 days, 4 hours
+/// ago") into seconds. The units are always days/hours/minutes/seconds with
+/// the zero parts omitted, so summing what is present is exact.
+fn parse_wg_ago(s: &str) -> Option<i64> {
+    let s = s.trim().strip_suffix("ago").unwrap_or(s);
+    let mut total = 0i64;
+    let mut seen = false;
+    for part in s.split(',') {
+        let mut it = part.split_whitespace();
+        let (Some(n), Some(unit)) = (it.next(), it.next()) else { continue };
+        let Ok(n) = n.parse::<i64>() else { continue };
+        let mult = match unit.trim_end_matches('s') {
+            "day" => 86400,
+            "hour" => 3600,
+            "minute" => 60,
+            "second" => 1,
+            _ => continue,
+        };
+        total += n * mult;
+        seen = true;
+    }
+    seen.then_some(total)
+}
+
+/// Seconds since this tunnel last handshook, or None if it never has.
+fn wg_age(st: &Status, iface: &str) -> Option<i64> {
+    wg_blocks(st)
+        .into_iter()
+        .find(|(n, _)| n == iface)
+        .and_then(|(_, b)| wg_field(&b, "latest handshake:"))
+        .and_then(|v| parse_wg_ago(&v))
+}
+
+/// A tunnel's health as a STEADY word, not a live counter. WireGuard rekeys
+/// about every two minutes whenever traffic flows, so a raw "N seconds ago"
+/// ticks up and snaps back to zero on every rekey - which reads as a
+/// reconnect though the tunnel never dropped. Anything inside the rekey window
+/// (plus slack) is simply "up"; only a genuinely old handshake is worth a
+/// number, and an ancient one is a fault.
+///   (text, is_fault)
+fn wg_health(age: Option<i64>) -> (String, bool) {
+    match age {
+        None => ("no handshake".into(), true),
+        Some(a) if a <= 180 => ("up".into(), false),
+        Some(a) if a <= 600 => (format!("last handshake {}m ago", a / 60), false),
+        Some(a) => (format!("stale - {}m since a handshake", a / 60), true),
+    }
 }
 
 fn wg_port(st: &Status, iface: &str, state: PortState, detail: String) -> Port {
@@ -642,10 +686,12 @@ fn ports(st: &Status) -> Vec<Port> {
         Some(req) if !req.is_empty() => {
             for t in &req {
                 let (state, detail) = if st.ifaces.contains_key(t) {
-                    (
-                        PortState::Up,
-                        wg_handshake(st, t).map(|h| format!("handshake {h}")).unwrap_or_else(|| "no handshake yet".into()),
-                    )
+                    let age = wg_age(st, t);
+                    let (text, bad) = wg_health(age);
+                    // No handshake at all, or a stale one, is amber on an
+                    // interface that is otherwise up - not the green of a
+                    // tunnel actually carrying traffic.
+                    (if bad { PortState::NoAddr } else { PortState::Up }, text)
                 } else {
                     (PortState::Down, format!("required by '{profile}'"))
                 };
@@ -773,13 +819,11 @@ fn judge(st: &Status) -> Judged {
 fn wg_summary(st: &Status) -> Vec<(String, String)> {
     wg_blocks(st)
         .into_iter()
-        .filter_map(|(name, block)| {
-            let h = wg_field(&block, "latest handshake:");
-            let t = wg_field(&block, "transfer:");
-            match (h, t) {
-                (Some(h), Some(t)) => Some((name, format!("handshake {h} · {t}"))),
-                (Some(h), None) => Some((name, format!("handshake {h}"))),
-                _ => None,
+        .map(|(name, block)| {
+            let (h, _) = wg_health(wg_field(&block, "latest handshake:").as_deref().and_then(parse_wg_ago));
+            match wg_field(&block, "transfer:") {
+                Some(t) => (name, format!("{h} · {t}")),
+                None => (name, h),
             }
         })
         .collect()
@@ -1350,7 +1394,19 @@ mod tests {
         s.wg = "interface: wg1\n  latest handshake: 3 seconds ago\ninterface: wg0\n  latest handshake: 12 seconds ago\n  transfer: 1.2 GiB received".into();
         let p = wg(&s);
         assert_eq!(p.state, PortState::Up);
-        assert_eq!(p.detail, "handshake 12 seconds ago");
+        // A fresh handshake reads as a steady "up", not a counter that resets
+        // on every rekey and looks like a reconnect.
+        assert_eq!(p.detail, "up");
+        // A two-minute-old handshake is still "up" - inside the rekey window.
+        s.wg = "interface: wg0\n  latest handshake: 2 minutes, 4 seconds ago".into();
+        assert_eq!(wg(&s).detail, "up");
+        // Genuinely old is amber and says so.
+        s.wg = "interface: wg0\n  latest handshake: 22 minutes ago".into();
+        let p = wg(&s);
+        assert_eq!(p.state, PortState::NoAddr);
+        assert!(p.detail.starts_with("stale"), "{}", p.detail);
+        assert_eq!(parse_wg_ago("1 minute, 2 seconds ago"), Some(62));
+        assert_eq!(parse_wg_ago("3 days, 4 hours ago"), Some(273600));
     }
 
     /// The headline says whether the box is doing what it promised, so silence
