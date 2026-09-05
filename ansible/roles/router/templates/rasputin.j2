@@ -35,7 +35,7 @@ END='# <<< rasputin managed <<<'
 
 die() { printf 'rasputin: %b\n' "$*" >&2; exit 1; }
 
-usage() { printf '%b\n' "usage: rasputin {{'{'}}{{ rasputin_profiles.keys()|join('|') }}|converge|refresh|confirm|status|portal|mac-new|join|forget{{'}'}}\n              [--rollback SECS] [--for SECS] [--check] [--scan]\n  profile = which leg faces the venue + whether a tunnel is required;\n            {{ eth_if }} serves the wired net unless it IS the uplink\n  refresh = re-apply the firewall for the uplink's current address\n  portal  = open a bounded hole to clear a captive portal (--check only probes)\n  mac-new = drop the pinned uplink MAC and take a fresh identity\n  join    = join a venue wifi: join <ssid> [passphrase], or --scan to list\n  forget  = drop a network that join wrote: forget <ssid>"; }
+usage() { printf '%b\n' "usage: rasputin {{'{'}}{{ rasputin_profiles.keys()|join('|') }}|converge|refresh|confirm|status|portal|mac-new|join|forget{{'}'}}\n              [--rollback SECS] [--for SECS] [--check] [--scan] [--band 2.4|5|any]\n  profile = which leg faces the venue + whether a tunnel is required;\n            {{ eth_if }} serves the wired net unless it IS the uplink\n  refresh = re-apply the firewall for the uplink's current address\n  portal  = open a bounded hole to clear a captive portal (--check only probes)\n  mac-new = drop the pinned uplink MAC and take a fresh identity\n  join    = join a venue wifi: join <ssid> [passphrase] [--band 2.4|5|any], or --scan to list\n  forget  = drop a network that join wrote: forget <ssid>"; }
 
 # Asking for a password in order to print the usage is the wrong first
 # impression, and the one every new operator gets. Answered before sudo.
@@ -680,6 +680,21 @@ wpa_derive_psk() {
   printf '%s' "$out" | grep -oE '^[[:space:]]*psk=[0-9a-f]{64}$' | tr -d '[:space:]'
 }
 
+# The 2.4 GHz band carries through walls where 5 GHz does not, and the built-in
+# Broadcom firmware picks the band itself - badly: measured 2026-09-05, it sat
+# on a 5 GHz AP at -72 dBm while a 2.4 GHz one of the same SSID was at -53, and
+# the tunnel lost handshakes until it was forced across. freq_list in the
+# network block is the only lever wpa_supplicant has over that firmware, so a
+# venue with a weak 5 GHz roam is pinned to a band at join time.
+band_freq_list() {
+  case "$1" in
+    2.4) echo "2412 2417 2422 2427 2432 2437 2442 2447 2452 2457 2462 2467 2472" ;;
+    5)   echo "5180 5200 5220 5240 5260 5280 5300 5320 5500 5520 5540 5560 5580 5600 5620 5640 5660 5680 5700 5745 5765 5785 5805 5825" ;;
+    any|'') echo "" ;;
+    *)   die "--band takes 2.4, 5 or any - got: $1" ;;
+  esac
+}
+
 join_network() {
   local ssid="${1:-}" pass="${2:-}" tmp top priority psk kind n
   [[ -n $ssid ]] || die "join needs an SSID:\n  rasputin join <ssid> [passphrase]\n  rasputin join --scan   (list what is on the air)"
@@ -745,6 +760,8 @@ join_network() {
     echo "# Written by 'rasputin join'. Drop it with 'rasputin forget'."
     echo "network={"
     printf '\tssid="%s"\n' "$ssid"
+    local _fl; _fl=$(band_freq_list "$BAND")
+    [[ -n $_fl ]] && printf '\tfreq_list=%s\n' "$_fl"
     if [[ -n $pass ]]; then
       printf '\t%s\n' "$psk"
     else
@@ -766,7 +783,7 @@ join_network() {
     rm -f "$MAC_PIN"
     echo "rasputin: dropped the pinned MAC - a new network gets a new identity"
   fi
-  echo "rasputin: wrote network block for \"$ssid\" ($kind, priority $priority)"
+  echo "rasputin: wrote network block for \"$ssid\" ($kind, priority $priority${BAND:+, ${BAND}GHz})"
   wpa_apply "$ssid"
 }
 
@@ -1615,6 +1632,7 @@ status() {
 
 mkdir -p "$STATE_DIR"
 ROLLBACK=""
+BAND=""
 PORTAL_SECS=""
 PORTAL_CHECK=""
 REFRESH_IF=""
@@ -1627,6 +1645,7 @@ while [[ $# -gt 0 ]]; do
     --for)      PORTAL_SECS="${2:?--for needs seconds}"; shift 2 ;;
     --check)    PORTAL_CHECK=1; shift ;;
     --scan)     JOIN_SCAN=1; shift ;;
+    --band)     BAND="${2:?--band needs 2.4, 5 or any}"; shift 2 ;;
     --if)       REFRESH_IF="${2:?--if needs an interface}"; shift 2 ;;
     # join takes an SSID and a passphrase positionally, so bare words are now
     # operands rather than a mistake. Anything shaped like an option still is
